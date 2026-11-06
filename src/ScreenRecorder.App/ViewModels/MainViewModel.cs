@@ -37,6 +37,25 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty] private CaptureSource? _selectedSource;
     [ObservableProperty] private AudioDevice? _selectedAudioDevice;
     [ObservableProperty] private bool _showCursor = true;
+    [ObservableProperty] private bool _showLogo = false;
+    [ObservableProperty] private string _logoText = "RECORDER";
+    [ObservableProperty] private float _logoOpacity = 0.5f;
+    [ObservableProperty] private float _logoScale = 1.0f;
+    [ObservableProperty] private string? _logoPath;
+    [ObservableProperty] private LogoPosition _selectedLogoPosition = LogoPosition.TopRight;
+    [ObservableProperty] private string _currentView = "Home"; // Home, General, Video, Image, About
+
+    [RelayCommand] private void SetView(string view) => CurrentView = view;
+
+    [RelayCommand]
+    private void SelectLogoFile()
+    {
+        var dialog = new Microsoft.Win32.OpenFileDialog
+        {
+            Filter = "Image Files|*.png;*.jpg;*.jpeg;*.bmp"
+        };
+        if (dialog.ShowDialog() == true) LogoPath = dialog.FileName;
+    }
 
     partial void OnSelectedAudioDeviceChanged(AudioDevice? value)
     {
@@ -55,6 +74,14 @@ public partial class MainViewModel : ObservableObject
         _sourceProvider = sourceProvider;
         _logger = logger;
         _settings = settings;
+
+        // Загружаем настройки логотипа
+        ShowLogo = _settings.Current.ShowLogo;
+        LogoText = _settings.Current.LogoText;
+        LogoOpacity = _settings.Current.LogoOpacity;
+        LogoScale = _settings.Current.LogoScale;
+        LogoPath = _settings.Current.LogoPath;
+        SelectedLogoPosition = _settings.Current.LogoPosition;
         
         _session.StateChanged += s => { 
             State = s; 
@@ -80,6 +107,25 @@ public partial class MainViewModel : ObservableObject
             if (device != null) SelectedAudioDevice = device;
         }
     }
+
+    [RelayCommand]
+    public void SaveSettings()
+    {
+        _settings.Current.ShowLogo = ShowLogo;
+        _settings.Current.LogoText = LogoText;
+        _settings.Current.LogoOpacity = LogoOpacity;
+        _settings.Current.LogoScale = LogoScale;
+        _settings.Current.LogoPath = LogoPath;
+        _settings.Current.LogoPosition = SelectedLogoPosition;
+        _settings.Save();
+    }
+
+    partial void OnShowLogoChanged(bool value) => SaveSettings();
+    partial void OnLogoTextChanged(string value) => SaveSettings();
+    partial void OnLogoOpacityChanged(float value) => SaveSettings();
+    partial void OnLogoScaleChanged(float value) => SaveSettings();
+    partial void OnLogoPathChanged(string? value) => SaveSettings();
+    partial void OnSelectedLogoPositionChanged(LogoPosition value) => SaveSettings();
 
     partial void OnSelectedCaptureModeChanged(CaptureMode value)
     {
@@ -135,9 +181,9 @@ public partial class MainViewModel : ObservableObject
 
         string? audioName = SelectedAudioDevice?.Name;
         if (audioName != null && audioName.Contains(": ")) audioName = audioName.Substring(audioName.IndexOf(": ") + 2);
-
-        var options = new RecordingOptions(capSource, AudioSourceMode.System, audioName, null, _lastFilePath, 30, 8000, ShowCursor);
-        _logger.Log($"START: {capSource.Width}x{capSource.Height} at {capSource.X},{capSource.Y} DPI-Aware. Audio: {audioName}. Cursor: {ShowCursor}");
+ 
+        var options = new RecordingOptions(capSource, AudioSourceMode.System, audioName, null, _lastFilePath, 30, 8000, ShowCursor, ShowLogo, LogoPath, LogoText, LogoOpacity, LogoScale, SelectedLogoPosition);
+        _logger.Log($"START: {capSource.Width}x{capSource.Height} at {capSource.X},{capSource.Y} Audio: {audioName}. Cursor: {ShowCursor}. Logo: {ShowLogo}");
         await _session.StartAsync(options, CancellationToken.None);
     }
 

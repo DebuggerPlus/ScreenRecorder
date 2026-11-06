@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Text.Json;
+using ScreenRecorder.Core.Models;
 
 namespace ScreenRecorder.App.Services;
 
@@ -8,6 +9,12 @@ public class AppSettings
 {
     public string OutputFolder { get; set; } = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyVideos), "ScreenRecorder");
     public string? LastAudioDevice { get; set; }
+    public bool ShowLogo { get; set; } = false;
+    public string LogoText { get; set; } = "RECORDER";
+    public float LogoOpacity { get; set; } = 0.5f;
+    public float LogoScale { get; set; } = 1.0f;
+    public string? LogoPath { get; set; }
+    public LogoPosition LogoPosition { get; set; } = LogoPosition.TopRight;
 }
 
 public class SettingsService

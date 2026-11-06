@@ -53,12 +53,68 @@ public class WindowsGraphicsCapture : IVideoCapture
             double fps = options.FramesPerSecond;
             double frameTimeMs = 1000.0 / fps;
 
+            // Загружаем логотип заранее, если он есть
+            Image? logoImage = null;
+            if (options.ShowLogo && !string.IsNullOrEmpty(options.LogoPath) && System.IO.File.Exists(options.LogoPath))
+            {
+                logoImage = Image.FromFile(options.LogoPath);
+            }
+
             while (!ct.IsCancellationRequested)
             {
                 long frameStartMs = sw.ElapsedMilliseconds;
                 
                 // Захват экрана
                 graphics.CopyFromScreen(startX, startY, 0, 0, rect.Size);
+
+                    // Отрисовка логотипа
+                    if (options.ShowLogo)
+                    {
+                        graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                        
+                        int lw, lh;
+                        if (logoImage != null) { lw = (int)(logoImage.Width * options.LogoScale); lh = (int)(logoImage.Height * options.LogoScale); }
+                        else { 
+                            using var tempFont = new Font("Arial", 24 * options.LogoScale, FontStyle.Bold);
+                            var size = graphics.MeasureString(options.LogoText, tempFont);
+                            lw = (int)size.Width; lh = (int)size.Height;
+                        }
+
+                        int padding = 20;
+                        int x = options.LogoPosition switch {
+                            LogoPosition.TopLeft => padding,
+                            LogoPosition.BottomLeft => padding,
+                            LogoPosition.TopRight => width - lw - padding,
+                            LogoPosition.BottomRight => width - lw - padding,
+                            LogoPosition.Center => (width - lw) / 2,
+                            _ => width - lw - padding
+                        };
+                        int y = options.LogoPosition switch {
+                            LogoPosition.TopLeft => padding,
+                            LogoPosition.TopRight => padding,
+                            LogoPosition.BottomLeft => height - lh - padding,
+                            LogoPosition.BottomRight => height - lh - padding,
+                            LogoPosition.Center => (height - lh) / 2,
+                            _ => padding
+                        };
+
+                        if (logoImage != null)
+                        {
+                            var cm = new ColorMatrix { Matrix33 = options.LogoOpacity };
+                            var ia = new ImageAttributes();
+                            ia.SetColorMatrix(cm);
+                            graphics.DrawImage(logoImage, new Rectangle(x, y, lw, lh), 0, 0, logoImage.Width, logoImage.Height, GraphicsUnit.Pixel, ia);
+                        }
+                        else if (!string.IsNullOrEmpty(options.LogoText))
+                        {
+                            using var font = new Font("Arial", 24 * options.LogoScale, FontStyle.Bold);
+                            var color = Color.FromArgb((int)(options.LogoOpacity * 255), Color.White);
+                            using var brush = new SolidBrush(color);
+                            using var shadowBrush = new SolidBrush(Color.FromArgb((int)(options.LogoOpacity * 128), Color.Black));
+                            graphics.DrawString(options.LogoText, font, shadowBrush, x + 2, y + 2);
+                            graphics.DrawString(options.LogoText, font, brush, x, y);
+                        }
+                    }
 
                 if (options.ShowCursor)
                 {
@@ -93,6 +149,7 @@ public class WindowsGraphicsCapture : IVideoCapture
                 int sleepTime = (int)(frameTimeMs - elapsed);
                 if (sleepTime > 0) await Task.Delay(sleepTime, ct);
             }
+            logoImage?.Dispose();
         }
         catch (Exception ex) { _logger.Log($"Capture Error: {ex.Message}"); }
         finally
