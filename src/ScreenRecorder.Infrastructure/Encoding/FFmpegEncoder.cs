@@ -33,10 +33,10 @@ public class FFmpegEncoder
         width = (width / 2) * 2;
         height = (height / 2) * 2;
 
-        // Ключевой флаг -vsync vfr (Variable Frame Rate) и корректный таймстамп
+        // Использование -re для чтения входного потока со скоростью реального времени (native frame rate)
         var args = $"-y -f rawvideo -pixel_format bgra -video_size {width}x{height} -framerate {fps} -i - " +
                    $"-c:v libx264 -pix_fmt yuv420p -preset ultrafast -crf 23 -b:v {bitrate}k " +
-                   $"-r {fps} \"{outputPath}\"";
+                   $"-r {fps} -vsync cfr \"{outputPath}\"";
         
         _uiLogger.Log($"FFmpeg Start: {width}x{height} @ {fps}fps");
 

@@ -7,8 +7,8 @@ using System.Threading.Tasks;
 using System.Diagnostics;
 using ScreenRecorder.Core.Interfaces;
 using ScreenRecorder.Core.Models;
-using ScreenRecorder.Core.Enums;
 using ScreenRecorder.Infrastructure.Encoding;
+using System.Windows.Forms;
 
 namespace ScreenRecorder.Infrastructure.Capture;
 
@@ -17,6 +17,7 @@ public class WindowsGraphicsCapture : IVideoCapture
     private readonly FFmpegEncoder _encoder;
     private readonly ILoggerService _logger;
     private CancellationTokenSource? _cts;
+    private Task? _captureTask;
 
     public WindowsGraphicsCapture(FFmpegEncoder encoder, ILoggerService logger)
     {
@@ -27,12 +28,13 @@ public class WindowsGraphicsCapture : IVideoCapture
     public Task StartAsync(RecordingOptions options, CancellationToken ct)
     {
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        _ = Task.Run(() => CaptureLoop(options, _cts.Token));
+        _captureTask = Task.Run(() => CaptureLoop(options, _cts.Token));
         return Task.CompletedTask;
     }
 
     private async Task CaptureLoop(RecordingOptions options, CancellationToken ct)
     {
+        long frames = 0;
         try
         {
             var source = options.Source;
@@ -51,50 +53,58 @@ public class WindowsGraphicsCapture : IVideoCapture
             
             while (!ct.IsCancellationRequested)
             {
-                long frameStartMs = sw.ElapsedMilliseconds;
-                
-                using (var screenBmp = new Bitmap(width, height, PixelFormat.Format32bppArgb))
-                using (var g = Graphics.FromImage(screenBmp))
+                frames++;
+                long targetTimeMs = (long)(frames * frameTimeMs);
+
+                graphics.CopyFromScreen(startX, startY, 0, 0, rect.Size);
+
+                if (options.ShowCursor)
                 {
-                    g.CopyFromScreen(startX, startY, 0, 0, rect.Size);
-
-                    if (options.ShowCursor)
-                    {
-                        var cursorRect = new Rectangle(
-                            System.Windows.Forms.Cursor.Position.X - startX, 
-                            System.Windows.Forms.Cursor.Position.Y - startY, 
-                            System.Windows.Forms.Cursors.Default.Size.Width, 
-                            System.Windows.Forms.Cursors.Default.Size.Height);
-                        System.Windows.Forms.Cursors.Default.Draw(g, cursorRect);
-                    }
-
-                    var data = screenBmp.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-                    try
-                    {
-                        int bytes = Math.Abs(data.Stride) * screenBmp.Height;
-                        byte[] rgbValues = new byte[bytes];
-                        Marshal.Copy(data.Scan0, rgbValues, 0, bytes);
-                        await _encoder.WriteFrameAsync(rgbValues);
-                    }
-                    finally { screenBmp.UnlockBits(data); }
+                    var cursorRect = new Rectangle(
+                        Cursor.Position.X - startX,
+                        Cursor.Position.Y - startY,
+                        Cursors.Default.Size.Width,
+                        Cursors.Default.Size.Height);
+                    Cursors.Default.Draw(graphics, cursorRect);
                 }
 
-                long elapsed = sw.ElapsedMilliseconds - frameStartMs;
-                int sleepTime = (int)(frameTimeMs - elapsed);
-                if (sleepTime > 0)
+                var data = bitmap.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+                try
                 {
-                    await Task.Delay(sleepTime, ct);
+                    int bytes = Math.Abs(data.Stride) * bitmap.Height;
+                    byte[] rgbValues = new byte[bytes];
+                    Marshal.Copy(data.Scan0, rgbValues, 0, bytes);
+                    await _encoder.WriteFrameAsync(rgbValues);
+                }
+                finally { bitmap.UnlockBits(data); }
+
+                long waitTime = targetTimeMs - sw.ElapsedMilliseconds;
+                if (waitTime > 0)
+                {
+                    await Task.Delay((int)waitTime, ct);
                 }
                 else
                 {
+                    // Если захват кадра занял больше времени, чем интервал (например, 40мс вместо 33мс),
+                    // мы НЕ пропускаем кадр, а просто идем к следующему.
+                    // FFmpeg с флагом -vsync cfr сам вставит дубликаты, если входной поток будет слишком медленным.
                     await Task.Yield();
                 }
             }
         }
         catch (Exception ex) { _logger.Log($"Capture Error: {ex.Message}"); }
+        finally
+        {
+            _logger.Log($"Video Stopped.");
+        }
     }
 
-    public Task StopAsync(CancellationToken ct) { _cts?.Cancel(); return Task.CompletedTask; }
+    public async Task StopAsync(CancellationToken ct) 
+    { 
+        _cts?.Cancel(); 
+        if (_captureTask != null) await Task.WhenAny(_captureTask, Task.Delay(3000));
+    }
+
     public Task PauseAsync(CancellationToken ct) => Task.CompletedTask;
     public Task ResumeAsync(CancellationToken ct) => Task.CompletedTask;
 }
