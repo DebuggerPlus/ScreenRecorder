@@ -34,7 +34,8 @@ public class WindowsGraphicsCapture : IVideoCapture
 
     private async Task CaptureLoop(RecordingOptions options, CancellationToken ct)
     {
-        long frames = 0;
+        long framesWritten = 0;
+        var sw = Stopwatch.StartNew();
         try
         {
             var source = options.Source;
@@ -43,19 +44,20 @@ public class WindowsGraphicsCapture : IVideoCapture
             int startX = source.X;
             int startY = source.Y;
 
+            // Используем один буфер для экономии памяти
             using var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
             using var graphics = Graphics.FromImage(bitmap);
             var rect = new Rectangle(0, 0, width, height);
+            byte[]? frameBuffer = null;
 
-            // Точный расчет времени для синхронизации FPS
-            var sw = Stopwatch.StartNew();
-            double frameTimeMs = 1000.0 / options.FramesPerSecond;
-            
+            double fps = options.FramesPerSecond;
+            double frameTimeMs = 1000.0 / fps;
+
             while (!ct.IsCancellationRequested)
             {
-                frames++;
-                long targetTimeMs = (long)(frames * frameTimeMs);
-
+                long frameStartMs = sw.ElapsedMilliseconds;
+                
+                // Захват экрана
                 graphics.CopyFromScreen(startX, startY, 0, 0, rect.Size);
 
                 if (options.ShowCursor)
@@ -68,34 +70,35 @@ public class WindowsGraphicsCapture : IVideoCapture
                     Cursors.Default.Draw(graphics, cursorRect);
                 }
 
+                // Копируем данные в буфер
                 var data = bitmap.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
                 try
                 {
                     int bytes = Math.Abs(data.Stride) * bitmap.Height;
-                    byte[] rgbValues = new byte[bytes];
-                    Marshal.Copy(data.Scan0, rgbValues, 0, bytes);
-                    await _encoder.WriteFrameAsync(rgbValues);
+                    if (frameBuffer == null || frameBuffer.Length != bytes) frameBuffer = new byte[bytes];
+                    Marshal.Copy(data.Scan0, frameBuffer, 0, bytes);
                 }
                 finally { bitmap.UnlockBits(data); }
 
-                long waitTime = targetTimeMs - sw.ElapsedMilliseconds;
-                if (waitTime > 0)
+                // Дублирование кадров, если захват отстает от реального времени
+                long dueFrames = (long)(sw.Elapsed.TotalSeconds * fps) + 1;
+                while (framesWritten < dueFrames && !ct.IsCancellationRequested)
                 {
-                    await Task.Delay((int)waitTime, ct);
+                    await _encoder.WriteFrameAsync(frameBuffer);
+                    framesWritten++;
                 }
-                else
-                {
-                    // Если захват кадра занял больше времени, чем интервал (например, 40мс вместо 33мс),
-                    // мы НЕ пропускаем кадр, а просто идем к следующему.
-                    // FFmpeg с флагом -vsync cfr сам вставит дубликаты, если входной поток будет слишком медленным.
-                    await Task.Yield();
-                }
+
+                // Ждем до следующего интервала захвата
+                long elapsed = sw.ElapsedMilliseconds - frameStartMs;
+                int sleepTime = (int)(frameTimeMs - elapsed);
+                if (sleepTime > 0) await Task.Delay(sleepTime, ct);
             }
         }
         catch (Exception ex) { _logger.Log($"Capture Error: {ex.Message}"); }
         finally
         {
-            _logger.Log($"Video Stopped.");
+            sw.Stop();
+            _logger.Log($"Video Stopped: {framesWritten} frames in {sw.Elapsed.TotalSeconds:F1}s (Avg {framesWritten / sw.Elapsed.TotalSeconds:F1} fps)");
         }
     }
 
