@@ -7,12 +7,13 @@ namespace ScreenRecorder.App.Services;
 public class AppSettings
 {
     public string OutputFolder { get; set; } = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyVideos), "ScreenRecorder");
+    public string? LastAudioDevice { get; set; }
 }
 
 public class SettingsService
 {
     private readonly string _path;
-    public AppSettings Current { get; private set; }
+    public AppSettings Current { get; private set; } = new AppSettings();
 
     public SettingsService()
     {
@@ -22,10 +23,15 @@ public class SettingsService
 
     public void Load()
     {
-        if (File.Exists(_path))
-            Current = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(_path)) ?? new AppSettings();
-        else
-            Current = new AppSettings();
+        try 
+        {
+            if (File.Exists(_path))
+            {
+                var json = File.ReadAllText(_path);
+                Current = JsonSerializer.Deserialize<AppSettings>(json) ?? new AppSettings();
+            }
+        }
+        catch { Current = new AppSettings(); }
     }
 
     public void Save()

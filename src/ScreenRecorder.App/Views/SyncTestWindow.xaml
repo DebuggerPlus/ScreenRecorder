@@ -1,0 +1,19 @@
+<Window x:Class="ScreenRecorder.App.Views.SyncTestWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Sync Tester" Height="350" Width="450" Topmost="True" Background="Black">
+    <Grid VerticalAlignment="Center" HorizontalAlignment="Center">
+        <StackPanel>
+            <TextBlock x:Name="TimerText" Text="0" Foreground="Lime" FontSize="72" FontFamily="Consolas" HorizontalAlignment="Center"/>
+            
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" Margin="0,20,0,0">
+                <Button x:Name="StartStopButton" Content="START" Click="StartStopButton_Click" Width="100" Height="40" Background="DarkGreen" Foreground="White" FontWeight="Bold" Margin="0,0,10,0"/>
+                <Button Content="RESET" Click="ResetButton_Click" Width="100" Height="40" Background="DimGray" Foreground="White" FontWeight="Bold"/>
+            </StackPanel>
+
+            <Button x:Name="SoundToggleBtn" Content="🔊 Sound ON" Click="SoundToggle_Click" Width="210" Height="40" Background="Transparent" Foreground="White" BorderBrush="Gray" Margin="0,10,0,0"/>
+            
+            <TextBlock Text="BEEP EVERY 10 SECONDS" Foreground="Gray" FontSize="14" HorizontalAlignment="Center" Margin="0,20,0,0"/>
+        </StackPanel>
+    </Grid>
+</Window>

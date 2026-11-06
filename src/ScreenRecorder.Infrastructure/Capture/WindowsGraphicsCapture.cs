@@ -4,6 +4,7 @@ using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Diagnostics;
 using ScreenRecorder.Core.Interfaces;
 using ScreenRecorder.Core.Models;
 using ScreenRecorder.Core.Enums;
@@ -23,70 +24,77 @@ public class WindowsGraphicsCapture : IVideoCapture
         _logger = logger;
     }
 
-    public Task StartAsync(CaptureSource source, CancellationToken ct)
+    public Task StartAsync(RecordingOptions options, CancellationToken ct)
     {
-        _logger.Log($"Starting real capture for {source.Name} ({source.Width}x{source.Height})");
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        
-        // Запускаем цикл захвата
-        _ = Task.Run(() => CaptureLoop(source, _cts.Token));
-        
+        _ = Task.Run(() => CaptureLoop(options, _cts.Token));
         return Task.CompletedTask;
     }
 
-    private async Task CaptureLoop(CaptureSource source, CancellationToken ct)
+    private async Task CaptureLoop(RecordingOptions options, CancellationToken ct)
     {
         try
         {
-            // Определяем область захвата (для простоты MVP - основной экран или область)
-            // В будущем здесь можно добавить смещение X,Y для CaptureMode.Region
+            var source = options.Source;
             int width = (source.Width / 2) * 2;
             int height = (source.Height / 2) * 2;
-            
+            int startX = source.X;
+            int startY = source.Y;
+
             using var bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
             using var graphics = Graphics.FromImage(bitmap);
-            
             var rect = new Rectangle(0, 0, width, height);
-            
-            _logger.Log("Capture loop active.");
 
+            // Точный расчет времени для синхронизации FPS
+            var sw = Stopwatch.StartNew();
+            double frameTimeMs = 1000.0 / options.FramesPerSecond;
+            
             while (!ct.IsCancellationRequested)
             {
-                // Захват экрана через GDI
-                graphics.CopyFromScreen(0, 0, 0, 0, rect.Size);
+                long frameStartMs = sw.ElapsedMilliseconds;
                 
-                // Извлекаем байты (BGRA)
-                var data = bitmap.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-                try
+                using (var screenBmp = new Bitmap(width, height, PixelFormat.Format32bppArgb))
+                using (var g = Graphics.FromImage(screenBmp))
                 {
-                    int bytes = Math.Abs(data.Stride) * bitmap.Height;
-                    byte[] rgbValues = new byte[bytes];
-                    Marshal.Copy(data.Scan0, rgbValues, 0, bytes);
-                    
-                    await _encoder.WriteFrameAsync(rgbValues);
-                }
-                finally
-                {
-                    bitmap.UnlockBits(data);
+                    g.CopyFromScreen(startX, startY, 0, 0, rect.Size);
+
+                    if (options.ShowCursor)
+                    {
+                        var cursorRect = new Rectangle(
+                            System.Windows.Forms.Cursor.Position.X - startX, 
+                            System.Windows.Forms.Cursor.Position.Y - startY, 
+                            System.Windows.Forms.Cursors.Default.Size.Width, 
+                            System.Windows.Forms.Cursors.Default.Size.Height);
+                        System.Windows.Forms.Cursors.Default.Draw(g, cursorRect);
+                    }
+
+                    var data = screenBmp.LockBits(rect, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+                    try
+                    {
+                        int bytes = Math.Abs(data.Stride) * screenBmp.Height;
+                        byte[] rgbValues = new byte[bytes];
+                        Marshal.Copy(data.Scan0, rgbValues, 0, bytes);
+                        await _encoder.WriteFrameAsync(rgbValues);
+                    }
+                    finally { screenBmp.UnlockBits(data); }
                 }
 
-                // Ограничение FPS (30 кадров)
-                await Task.Delay(33, ct);
+                long elapsed = sw.ElapsedMilliseconds - frameStartMs;
+                int sleepTime = (int)(frameTimeMs - elapsed);
+                if (sleepTime > 0)
+                {
+                    await Task.Delay(sleepTime, ct);
+                }
+                else
+                {
+                    await Task.Yield();
+                }
             }
         }
-        catch (OperationCanceledException) { }
-        catch (Exception ex)
-        {
-            _logger.Log($"Capture Loop Error: {ex.Message}");
-        }
+        catch (Exception ex) { _logger.Log($"Capture Error: {ex.Message}"); }
     }
 
+    public Task StopAsync(CancellationToken ct) { _cts?.Cancel(); return Task.CompletedTask; }
     public Task PauseAsync(CancellationToken ct) => Task.CompletedTask;
     public Task ResumeAsync(CancellationToken ct) => Task.CompletedTask;
-    public Task StopAsync(CancellationToken ct)
-    {
-        _cts?.Cancel();
-        _logger.Log("Capture stopped.");
-        return Task.CompletedTask;
-    }
 }

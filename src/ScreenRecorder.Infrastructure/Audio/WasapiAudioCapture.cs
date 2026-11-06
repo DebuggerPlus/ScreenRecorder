@@ -1,34 +1,67 @@
+using System;
+using System.Threading;
+using System.Threading.Tasks;
 using ScreenRecorder.Core.Interfaces;
-using ScreenRecorder.Core.Enums;
-using Microsoft.Extensions.Logging;
 using NAudio.Wave;
-using NAudio.CoreAudioApi;
 
 namespace ScreenRecorder.Infrastructure.Audio;
 
 public class WasapiAudioCapture : IAudioCapture
 {
-    private WasapiLoopbackCapture? _loopbackCapture;
-    private WasapiCapture? _micCapture; // WasapiIn is sometimes not found, WasapiCapture is more generic
-    private readonly ILogger<WasapiAudioCapture> _logger;
-    
-    public WasapiAudioCapture(ILogger<WasapiAudioCapture> logger)
+    private IWaveIn? _captureDevice;
+    private WaveFileWriter? _writer;
+    private readonly ILoggerService _logger;
+
+    public WasapiAudioCapture(ILoggerService logger)
     {
         _logger = logger;
     }
 
-    public Task StartAsync(AudioSourceMode mode, string? systemDeviceId, string? microphoneDeviceId, CancellationToken cancellationToken)
+    public Task StartAsync(string deviceId, string outputPath, CancellationToken ct)
     {
-        _logger.LogInformation("Starting audio capture: {Mode}", mode);
+        try
+        {
+            _logger.Log($"NAudio: Starting capture for {deviceId}");
+            
+            // Если ID содержит системные признаки - используем Loopback, иначе WaveIn (для микрофона)
+            if (deviceId.Contains("System") || deviceId.ToLower().Contains("speaker") || deviceId.ToLower().Contains("output"))
+            {
+                _captureDevice = new WasapiLoopbackCapture();
+            }
+            else
+            {
+                _captureDevice = new WaveInEvent(); // Самый надежный для микрофона в .NET
+            }
+
+            _writer = new WaveFileWriter(outputPath, _captureDevice.WaveFormat);
+
+            _captureDevice.DataAvailable += (s, e) =>
+            {
+                _writer?.Write(e.Buffer, 0, e.BytesRecorded);
+            };
+
+            _captureDevice.RecordingStopped += (s, e) =>
+            {
+                _writer?.Dispose();
+                _writer = null;
+                _captureDevice?.Dispose();
+                _captureDevice = null;
+            };
+
+            _captureDevice.StartRecording();
+            _logger.Log("NAudio: Capture started.");
+        }
+        catch (Exception ex)
+        {
+            _logger.Log($"NAudio Error: {ex.Message}");
+        }
         return Task.CompletedTask;
     }
 
-    public Task StopAsync(CancellationToken cancellationToken)
+    public Task StopAsync()
     {
-        _loopbackCapture?.StopRecording();
-        _loopbackCapture?.Dispose();
-        _micCapture?.StopRecording();
-        _micCapture?.Dispose();
+        _captureDevice?.StopRecording();
+        _logger.Log("NAudio: Capture stopped.");
         return Task.CompletedTask;
     }
 }
