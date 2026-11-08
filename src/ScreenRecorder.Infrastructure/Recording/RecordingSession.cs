@@ -47,9 +47,9 @@ public class RecordingSession : IRecordingSession
         await _videoCapture.StartAsync(options, ct);
 
         // 2. Стартуем аудио отдельно через NAudio
-        if (options.SystemAudioDeviceId != "None")
+        if (options.SystemAudioDeviceId != "None" && !string.IsNullOrEmpty(options.SystemAudioDeviceId))
         {
-            await _audioCapture.StartAsync(options.SystemAudioDeviceId ?? "default", _tempAudioPath, ct);
+            await _audioCapture.StartAsync(options.SystemAudioDeviceId, _tempAudioPath, ct);
         }
 
         _stopwatch.Restart();

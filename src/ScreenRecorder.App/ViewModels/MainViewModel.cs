@@ -179,11 +179,10 @@ public partial class MainViewModel : ObservableObject
         _lastFilePath = Path.Combine(_settings.Current.OutputFolder, $"record_{DateTime.Now:yyyyMMdd_HHmmss}.mp4");
         if (!Directory.Exists(_settings.Current.OutputFolder)) Directory.CreateDirectory(_settings.Current.OutputFolder);
 
-        string? audioName = SelectedAudioDevice?.Name;
-        if (audioName != null && audioName.Contains(": ")) audioName = audioName.Substring(audioName.IndexOf(": ") + 2);
+        string? audioId = SelectedAudioDevice?.Id;
  
-        var options = new RecordingOptions(capSource, AudioSourceMode.System, audioName, null, _lastFilePath, 30, 8000, ShowCursor, ShowLogo, LogoPath, LogoText, LogoOpacity, LogoScale, SelectedLogoPosition);
-        _logger.Log($"START: {capSource.Width}x{capSource.Height} at {capSource.X},{capSource.Y} Audio: {audioName}. Cursor: {ShowCursor}. Logo: {ShowLogo}");
+        var options = new RecordingOptions(capSource, AudioSourceMode.System, audioId, null, _lastFilePath, 30, 8000, ShowCursor, ShowLogo, LogoPath, LogoText, LogoOpacity, LogoScale, SelectedLogoPosition);
+        _logger.Log($"START: {capSource.Width}x{capSource.Height} at {capSource.X},{capSource.Y} Audio ID: {audioId}. Cursor: {ShowCursor}. Logo: {ShowLogo}");
         await _session.StartAsync(options, CancellationToken.None);
     }
 
@@ -209,6 +208,36 @@ public partial class MainViewModel : ObservableObject
     [RelayCommand] private void DeleteFile(RecordingFile file) { if (File.Exists(file.Path)) { try { File.Delete(file.Path); SavedFiles.Remove(file); } catch { } } }
     [RelayCommand] private void OpenRecordingsWindow() { RefreshFiles(); new RecordingsWindow(this).Show(); }
     [RelayCommand] private void PlayLastRecording() { if (!string.IsNullOrEmpty(_lastFilePath) && File.Exists(_lastFilePath)) Process.Start(new ProcessStartInfo(_lastFilePath) { UseShellExecute = true }); }
+    
+    [RelayCommand]
+    private void RenameFile(RecordingFile file)
+    {
+        var oldPath = file.Path;
+        var directory = Path.GetDirectoryName(oldPath);
+        var extension = Path.GetExtension(oldPath);
+        
+        // В .NET 8/Windows лучше использовать Microsoft.VisualBasic.Interaction.InputBox напрямую без инстанса
+        string newName = Microsoft.VisualBasic.Interaction.InputBox("Enter new name:", "Rename File", Path.GetFileNameWithoutExtension(oldPath));
+        
+        if (!string.IsNullOrWhiteSpace(newName))
+        {
+            var newPath = Path.Combine(directory!, newName + extension);
+            if (!File.Exists(newPath))
+            {
+                try {
+                    File.Move(oldPath, newPath);
+                    RefreshFiles();
+                } catch (Exception ex) {
+                    MessageBox.Show($"Error renaming file: {ex.Message}");
+                }
+            }
+            else
+            {
+                MessageBox.Show("File already exists.");
+            }
+        }
+    }
+
     [RelayCommand] private void OpenSettings() {
         var dialog = new Microsoft.Win32.OpenFolderDialog();
         if (dialog.ShowDialog() == true) { _settings.Current.OutputFolder = dialog.FolderName; _settings.Save(); RefreshFiles(); }
@@ -219,6 +248,8 @@ public partial class MainViewModel : ObservableObject
         foreach (var s in sources) AvailableSources.Add(s);
         SelectedSource = AvailableSources.FirstOrDefault();
     }
+
+    [RelayCommand] private void RefreshAudioSources() => LoadAudioDevices();
 
     private SyncTestWindow? _syncTestWindow;
 

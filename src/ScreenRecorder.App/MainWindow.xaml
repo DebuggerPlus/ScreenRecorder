@@ -64,6 +64,8 @@
                     </StackPanel>
                     
                     <StackPanel Orientation="Horizontal" DockPanel.Dock="Right">
+                        <Button Content="PLAY LAST" Command="{Binding PlayLastRecordingCommand}" 
+                                Width="100" Height="40" Background="#555" Foreground="White" FontWeight="Bold" Margin="0,0,10,0"/>
                         <Button Content="REC" Command="{Binding StartRecordingCommand}" 
                                 Width="80" Height="40" Background="#CC0000" Foreground="White" FontWeight="Bold" Margin="0,0,10,0"/>
                         <Button Content="STOP" Command="{Binding StopRecordingCommand}" 
@@ -88,6 +90,7 @@
                     <TextBlock Text="Audio Settings" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,10"/>
                     <ComboBox ItemsSource="{Binding AudioDevices}" SelectedItem="{Binding SelectedAudioDevice}"
                               DisplayMemberPath="Name" Height="35" Margin="0,0,0,10"/>
+                    <Button Content="Refresh Audio Sources" Command="{Binding RefreshAudioSourcesCommand}" Height="30" Margin="0,0,0,20"/>
                 </StackPanel>
 
                 <!-- Video / Logo Settings View -->
