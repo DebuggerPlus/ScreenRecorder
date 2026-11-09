@@ -1,0 +1,188 @@
+Для твоего ScreenRecorder (WPF, .NET 8, Windows 10) я рекомендую реализовать шумоподавление как отдельный модуль аудиообработки, который будет работать между захватом микрофона и передачей звука в видеокодер.
+
+Причём лучше сделать это не просто как один фильтр, а как полноценную систему обработки звука с возможностью включать и отключать отдельные эффекты.
+
+## 1. Предлагаемая архитектура
+
+Audio Capture
+
+NAudio · e2eSoft iVCam · Microphone
+
+Audio Processing Pipeline
+
+Noise Suppression · Noise Gate · Gain · Limiter
+
+Audio Encoder
+
+AAC / FFmpeg
+
+Video Recording / MP4
+
+Важный принцип: фильтрация должна происходить до кодирования аудио. Тогда она будет работать независимо от выбранного источника микрофона.
+
+## 2. Какой алгоритм использовать
+
+Я бы предусмотрел три уровня фильтрации.
+
+| Фильтр                 | Назначение                                   | Приоритет     |
+| ---------------------- | -------------------------------------------- | ------------- |
+| High-Pass Filter       | Убирает низкочастотный гул, ветер, вибрации  | Высокий       |
+| Noise Gate             | Убирает шум, когда ты не говоришь            | Высокий       |
+| AI Noise Suppression   | Убирает постоянный фоновый шум во время речи | Очень высокий |
+| Limiter                | Предотвращает перегрузку и хрип              | Средний       |
+| Automatic Gain Control | Автоматически регулирует громкость           | Опционально   |
+
+### Какую технологию выбрать
+
+Я бы рассмотрел два варианта:
+
+Вариант A — WebRTC Audio Processing Module (APM)
+
+- Noise Suppression.
+- Automatic Gain Control.
+- High-Pass Filter.
+- Acoustic Echo Cancellation.
+
+Это проверенная технология обработки голоса, используемая в коммуникационных приложениях.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://webrtc.googlesource.com\&sz=32)
+
+Git at Google+1
+
+
+
+Вариант B — RNNoise
+
+Мой выбор для качественного шумоподавления речи
+
+[GitHub - jagger2048/rnnoise-windows: This is a RNNoise windows demo. It was modified and restructured so that it can be compiled with MSVC, VS2017, VS2019.](https://images.openai.com/static-rsc-4/fNBh1gAHeRnJV3YZm9vMkFX1NWnTK89o-m6Bc2znSoCBqaPo1fAZbEJRAD0Y6thhHmiRRKGigmWc3ShnLRvR7CiaIcnf2VC7MQBX3UNnawiDwuZf9AsoIyrbiAsVSfUo-YuB-zzVXlu4NBX-PdJCTB-3EboiSW9gqUctVVh8Hms?purpose=inline)
+
+[github.com](https://github.com/jagger2048/rnnoise-windows?utm_source=chatgpt.com)
+
+RNNoise использует нейронную сеть для отделения человеческой речи от фонового шума.
+
+Особенности:
+
+- Работает в реальном времени.
+- Обрабатывает аудио блоками по 480 сэмплов.
+- Требует 48 kHz, mono.
+- Один блок соответствует 10 мс аудио.&#x20;
+
+  [image](https://www.google.com/s2/favicons?domain=https://github.com\&sz=32)
+
+  GitHub+1
+
+
+
+Для твоего приложения я бы выбрал RNNoise как основной алгоритм, а High-Pass и Noise Gate сделал дополнительными настраиваемыми фильтрами.
+
+## 3. Как встроить в существующий проект
+
+Я проверил доступные файлы репозитория.
+
+В проекте уже есть:
+
+- WPF и .NET 8.
+- `ScreenRecorder.Core`.
+- `ScreenRecorder.Infrastructure`.
+- NAudio 2.2.1.
+- NAudio.Wasapi 2.2.1.
+
+То есть дополнительный аудиофреймворк для базовой обработки не нужен. NAudio уже предоставляет интерфейс `ISampleProvider`, через который можно организовать последовательную обработку аудиосэмплов.&#x20;
+
+[image](https://www.google.com/s2/favicons?domain=https://github.com\&sz=32)
+
+GitHub+1
+
+
+
+Предлагаю следующую структуру:
+
+```
+ScreenRecorder.Core
+ └── Audio
+     ├── AudioProcessingSettings.cs
+     ├── IAudioNoiseSuppressor.cs
+     └── NoiseSuppressionLevel.cs
+
+ScreenRecorder.Infrastructure
+ └── Audio
+     ├── Processing
+     │   ├── AudioProcessingPipeline.cs
+     │   ├── HighPassFilter.cs
+     │   ├── NoiseGate.cs
+     │   ├── RnNoiseSuppressor.cs
+     │   └── AudioLimiter.cs
+     │
+     └── Capture
+         └── ExistingAudioCapture.cs
+
+ScreenRecorder.App
+ └── Views
+     └── AudioSettingsView.xaml
+```
+
+Важный момент: фильтровать нужно именно микрофонный канал, а не весь готовый аудиомикс. Тогда системный звук компьютера останется неизменным.
+
+## 4. Как должен работать аудиопоток
+
+Особенно важно правильно организовать потоки выполнения:
+
+1. NAudio получает аудио от микрофона.
+2. Полученные данные помещаются в буфер.
+3. Отдельный рабочий поток обрабатывает аудио блоками.
+4. RNNoise очищает звук.
+5. Дополнительные фильтры корректируют сигнал.
+6. Обработанный звук поступает в очередь кодировщика.
+
+Не рекомендую запускать тяжёлую обработку непосредственно внутри `DataAvailable` или WASAPI callback: это может привести к пропуску аудиоданных.
+
+## 5. Какую панель настроек добавить
+
+Microphone Audio Processing
+
+Noise Reduction
+
+Enabled
+
+AI Noise Suppression (RNNoise)
+
+ON
+
+Suppression Level
+
+LowMediumHigh
+
+High-Pass Filter
+
+Noise Gate
+
+Automatic Gain Control
+
+Limiter
+
+Input Level
+
+Microphone volume
+
+80%
+
+Иллюстрация предлагаемого интерфейса, не работающие настройки приложения.
+
+Ещё одна полезная возможность — кнопка Test Microphone, позволяющая прослушать исходный и обработанный звук.
+
+## 6. Предлагаю порядок разработки
+
+Я бы не стал сразу внедрять всё.
+
+1. Создать независимую архитектуру Audio Processing Pipeline.
+2. Реализовать High-Pass Filter и Noise Gate.
+3. Подключить RNNoise через native DLL.
+4. Добавить настройки в WPF.
+5. Добавить тестирование качества звука и нагрузки CPU.
+
+Моя рекомендация: сначала реализовать архитектуру и базовые фильтры на существующем NAudio 2.2.1, не меняя механизм записи видео и аудио. Затем подключить RNNoise отдельным компонентом.
+
+Так мы сможем развивать обработку звука независимо от остального ScreenRecorder.
+
+Если одобряешь эту архитектуру, следующим шагом подготовлю подробное техническое задание `AudioNoiseSuppression.md` для твоего Hermes DeveloperAgent с этапами реализации и критериями проверки.
