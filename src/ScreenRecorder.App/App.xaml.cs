@@ -35,6 +35,10 @@ public partial class App : Application
         services.AddSingleton<FFmpegEncoder>();
         services.AddSingleton<IRecordingSession, RecordingSession>();
         services.AddSingleton<ICaptureSourceProvider, WindowsGraphicsCaptureSourceProvider>();
+        services.AddSingleton<IAudioDeviceService, AudioDeviceService>();
+        services.AddSingleton<IAudioTestService, AudioTestService>();
+        services.AddTransient<AudioSettingsViewModel>();
+        services.AddSingleton<Func<AudioSettingsViewModel>>(sp => () => sp.GetRequiredService<AudioSettingsViewModel>());
         services.AddTransient<MainViewModel>();
         services.AddTransient<MainWindow>();
         services.AddTransient<LogWindow>();

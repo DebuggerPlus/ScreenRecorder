@@ -26,4 +26,5 @@ public sealed record RecordingOptions(
     string LogoText = "RECORDER",
     float LogoOpacity = 0.5f,
     float LogoScale = 1.0f,
-    LogoPosition LogoPosition = LogoPosition.TopRight);
+    LogoPosition LogoPosition = LogoPosition.TopRight,
+    AudioCaptureSettings? AudioSettings = null);

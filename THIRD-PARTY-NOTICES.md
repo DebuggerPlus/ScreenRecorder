@@ -10,7 +10,8 @@ This project uses several third-party libraries and components. This file contai
 ## 2. NAudio
 * **Website:** https://github.com/naudio/NAudio
 * **License:** MIT License
-* **Usage:** Used for WASAPI audio loopback capture (system sound) and microphone input.
+* **Usage:** Used for WASAPI audio loopback capture (system sound) and microphone input, and for audio processing (biquad filters for the equalizer, WDL resampler) and WAV reading/writing in the audio settings and test tools.
+* **Note:** NAudio.Core bundles a port of the WDL resampler by Cockos (zlib-style permissive license).
 
 ## 3. CommunityToolkit.Mvvm
 * **Website:** https://github.com/CommunityToolkit/dotnet

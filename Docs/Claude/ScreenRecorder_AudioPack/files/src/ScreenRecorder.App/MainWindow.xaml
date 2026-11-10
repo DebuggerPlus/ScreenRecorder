@@ -1,0 +1,171 @@
+<Window x:Class="ScreenRecorder.App.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:core="clr-namespace:ScreenRecorder.Core.Enums;assembly=ScreenRecorder.Core"
+        xmlns:sys="clr-namespace:System;assembly=mscorlib"
+        xmlns:conv="clr-namespace:ScreenRecorder.App.Converters"
+        xmlns:models="clr-namespace:ScreenRecorder.Core.Models;assembly=ScreenRecorder.Core"
+        Title="Screen Recorder Pro" Height="650" Width="850" Background="#F0F0F0"
+        WindowStartupLocation="CenterScreen">
+    <Window.Resources>
+        <conv:NullToVisibilityConverter x:Key="NullToVisibilityConverter"/>
+        <conv:ViewConverter x:Key="ViewConverter"/>
+        <conv:PosToAlignConverter x:Key="PosToAlignConverter"/>
+        <BooleanToVisibilityConverter x:Key="BoolToVis"/>
+        <ObjectDataProvider x:Key="CaptureModes" MethodName="GetValues" ObjectType="{x:Type sys:Enum}">
+            <ObjectDataProvider.MethodParameters>
+                <x:Type TypeName="core:CaptureMode"/>
+            </ObjectDataProvider.MethodParameters>
+        </ObjectDataProvider>
+        <ObjectDataProvider x:Key="LogoPositions" MethodName="GetValues" ObjectType="{x:Type sys:Enum}">
+            <ObjectDataProvider.MethodParameters>
+                <x:Type TypeName="models:LogoPosition"/>
+            </ObjectDataProvider.MethodParameters>
+        </ObjectDataProvider>
+    </Window.Resources>
+
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="200"/>
+            <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
+
+        <!-- BandiCam style Sidebar -->
+        <Border Grid.Column="0" Background="#2C2C2C">
+            <StackPanel Margin="0,20,0,0">
+                <Button Content="Home" Command="{Binding SetViewCommand}" CommandParameter="Home" Style="{StaticResource NavButtonStyle}"/>
+                <Button Content="General" Command="{Binding SetViewCommand}" CommandParameter="General" Style="{StaticResource NavButtonStyle}"/>
+                <Button Content="Video" Command="{Binding SetViewCommand}" CommandParameter="Video" Style="{StaticResource NavButtonStyle}"/>
+                <Button Content="Image" Command="{Binding SetViewCommand}" CommandParameter="Image" Style="{StaticResource NavButtonStyle}"/>
+                <Button Content="About" Command="{Binding SetViewCommand}" CommandParameter="About" Style="{StaticResource NavButtonStyle}"/>
+                
+                <Border Height="2" Background="#444" Margin="10,20"/>
+                
+                <Button Content="Audio Settings" Command="{Binding OpenAudioSettingsCommand}" Style="{StaticResource NavButtonStyle}"/>
+                <Button Content="Test Sync" Command="{Binding OpenSyncTestCommand}" Style="{StaticResource NavButtonStyle}"/>
+                <Button Content="Recordings" Command="{Binding OpenRecordingsWindowCommand}" Style="{StaticResource NavButtonStyle}"/>
+            </StackPanel>
+        </Border>
+
+        <!-- Main Content Area -->
+        <Grid Grid.Column="1" Background="White">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <!-- Header / REC Bar -->
+            <Border Grid.Row="0" Background="#F8F8F8" BorderBrush="#DDD" BorderThickness="0,0,0,1" Padding="20,10">
+                <DockPanel>
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <Ellipse Width="15" Height="15" Fill="Red" Margin="0,0,10,0" 
+                                 Visibility="{Binding State, Converter={StaticResource BoolToVis}}"/>
+                        <TextBlock Text="Screen Recorder Pro" FontSize="18" FontWeight="Bold"/>
+                    </StackPanel>
+                    
+                    <StackPanel Orientation="Horizontal" DockPanel.Dock="Right">
+                        <Button Content="PLAY LAST" Command="{Binding PlayLastRecordingCommand}" 
+                                Width="100" Height="40" Background="#555" Foreground="White" FontWeight="Bold" Margin="0,0,10,0"/>
+                        <Button Content="REC" Command="{Binding StartRecordingCommand}" 
+                                Width="80" Height="40" Background="#CC0000" Foreground="White" FontWeight="Bold" Margin="0,0,10,0"/>
+                        <Button Content="STOP" Command="{Binding StopRecordingCommand}" 
+                                Width="80" Height="40" Background="#333" Foreground="White" FontWeight="Bold" Margin="0,0,10,0"/>
+                    </StackPanel>
+                </DockPanel>
+            </Border>
+
+            <!-- Content Switcher -->
+            <Grid Grid.Row="1" Margin="20">
+                <!-- Home View -->
+                <StackPanel Visibility="{Binding CurrentView, Converter={StaticResource ViewConverter}, ConverterParameter=Home}">
+                    <TextBlock Text="Mode Selection" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,10"/>
+                    <ComboBox ItemsSource="{Binding Source={StaticResource CaptureModes}}" 
+                              SelectedItem="{Binding SelectedCaptureMode}" Height="35" Margin="0,0,0,20"/>
+                    
+                    <TextBlock Text="Capture Source" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,10"/>
+                    <ComboBox ItemsSource="{Binding AvailableSources}" SelectedItem="{Binding SelectedSource}"
+                              DisplayMemberPath="Name" Height="35" Margin="0,0,0,10"/>
+                    <Button Content="Refresh Sources" Command="{Binding RefreshSourcesCommand}" Height="30" Margin="0,0,0,20"/>
+
+                    <TextBlock Text="Audio Settings" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,10"/>
+                    <ComboBox ItemsSource="{Binding AudioDevices}" SelectedItem="{Binding SelectedAudioDevice}"
+                              DisplayMemberPath="Name" Height="35" Margin="0,0,0,10"/>
+                    <Button Content="Refresh Audio Sources" Command="{Binding RefreshAudioSourcesCommand}" Height="30" Margin="0,0,0,10"/>
+                    <Button Content="Audio Settings, Equalizer and Test..." Command="{Binding OpenAudioSettingsCommand}" Height="30" Margin="0,0,0,20"/>
+                </StackPanel>
+
+                <!-- Video / Logo Settings View -->
+                <ScrollViewer Visibility="{Binding CurrentView, Converter={StaticResource ViewConverter}, ConverterParameter=Video}">
+                    <StackPanel>
+                        <TextBlock Text="Overlay Settings" FontSize="18" FontWeight="Bold" Margin="0,0,0,15"/>
+                        
+                        <CheckBox Content="Show Mouse Cursor" IsChecked="{Binding ShowCursor}" FontSize="14" Margin="0,0,0,15"/>
+                        
+                        <GroupBox Header="Logo / Watermark" Padding="10">
+                            <StackPanel>
+                                <CheckBox Content="Add logo overlay to video" IsChecked="{Binding ShowLogo}" Margin="0,0,0,10"/>
+                                
+                                <TextBlock Text="Position:" Margin="0,5"/>
+                                <ComboBox ItemsSource="{Binding Source={StaticResource LogoPositions}}" 
+                                          SelectedItem="{Binding SelectedLogoPosition}" Height="30" Margin="0,0,0,10"/>
+
+                                <TextBlock Text="Logo Text:" Margin="0,5"/>
+                                <TextBox Text="{Binding LogoText, UpdateSourceTrigger=PropertyChanged}" Height="30" Margin="0,0,0,10"/>
+                                
+                                <Button Content="Select Logo Image File..." Command="{Binding SelectLogoFileCommand}" Height="30" Margin="0,0,0,5"/>
+                                <TextBlock Text="{Binding LogoPath}" FontSize="11" Foreground="Gray" TextWrapping="Wrap" Margin="0,0,0,15"/>
+
+                                <Grid>
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="40"/></Grid.ColumnDefinitions>
+                                    <TextBlock Text="Opacity" Grid.Column="0" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                                    <Slider Grid.Column="1" Minimum="0" Maximum="1" Value="{Binding LogoOpacity}" TickFrequency="0.1" IsSnapToTickEnabled="True"/>
+                                    <TextBlock Text="{Binding LogoOpacity}" Grid.Column="2" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+                                </Grid>
+
+                                <Grid Margin="0,10">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="40"/></Grid.ColumnDefinitions>
+                                    <TextBlock Text="Scale" Grid.Column="0" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                                    <Slider Grid.Column="1" Minimum="0.1" Maximum="3" Value="{Binding LogoScale}" TickFrequency="0.1" IsSnapToTickEnabled="True"/>
+                                    <TextBlock Text="{Binding LogoScale}" Grid.Column="2" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+                                </Grid>
+
+                                <TextBlock Text="Live Preview:" FontWeight="Bold" Margin="0,15,0,5"/>
+                                <Border Background="#111" Height="150" BorderBrush="#CCC" BorderThickness="1">
+                                    <Grid>
+                                        <!-- Preview Background Placeholder -->
+                                        <TextBlock Text="VIDEO PREVIEW AREA" Foreground="#333" HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="20" FontWeight="Bold"/>
+                                        
+                                        <!-- The actual logo preview -->
+                                        <ContentControl HorizontalAlignment="{Binding SelectedLogoPosition, Converter={StaticResource PosToAlignConverter}, ConverterParameter=H}"
+                                                       VerticalAlignment="{Binding SelectedLogoPosition, Converter={StaticResource PosToAlignConverter}, ConverterParameter=V}"
+                                                       Margin="10">
+                                            <Grid>
+                                                <Image Source="{Binding LogoPath}" Stretch="Uniform" Opacity="{Binding LogoOpacity}"
+                                                       Visibility="{Binding LogoPath, Converter={StaticResource NullToVisibilityConverter}}">
+                                                    <Image.LayoutTransform><ScaleTransform ScaleX="{Binding LogoScale}" ScaleY="{Binding LogoScale}"/></Image.LayoutTransform>
+                                                </Image>
+                                                <TextBlock Text="{Binding LogoText}" Foreground="White" FontSize="20" FontWeight="Bold" Opacity="{Binding LogoOpacity}"
+                                                            Visibility="{Binding LogoPath, Converter={StaticResource ViewConverter}, ConverterParameter={x:Null}}">
+                                                     <TextBlock.LayoutTransform><ScaleTransform ScaleX="{Binding LogoScale}" ScaleY="{Binding LogoScale}"/></TextBlock.LayoutTransform>
+                                                 </TextBlock>
+                                            </Grid>
+                                        </ContentControl>
+                                    </Grid>
+                                </Border>
+                            </StackPanel>
+                        </GroupBox>
+                    </StackPanel>
+                </ScrollViewer>
+            </Grid>
+
+            <!-- Bottom Status Bar -->
+            <Border Grid.Row="2" Background="#EEE" Padding="10,5">
+                <DockPanel>
+                    <TextBlock Text="{Binding State}" Foreground="#666"/>
+                    <TextBlock Text="{Binding TimerDisplay}" DockPanel.Dock="Right" FontWeight="Bold" Foreground="DarkBlue"/>
+                </DockPanel>
+            </Border>
+        </Grid>
+    </Grid>
+</Window>

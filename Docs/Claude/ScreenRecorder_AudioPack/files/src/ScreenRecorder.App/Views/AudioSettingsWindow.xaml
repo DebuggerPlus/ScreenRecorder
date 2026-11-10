@@ -1,0 +1,266 @@
+<Window x:Class="ScreenRecorder.App.Views.AudioSettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Audio Settings" Height="760" Width="820" MinHeight="560" MinWidth="700"
+        Background="#F0F0F0" WindowStartupLocation="CenterOwner">
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolToVis"/>
+        <Style x:Key="FieldLabel" TargetType="TextBlock">
+            <Setter Property="Margin" Value="0,8,0,3"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+        </Style>
+        <Style x:Key="Hint" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="#666"/>
+            <Setter Property="FontSize" Value="11"/>
+            <Setter Property="TextWrapping" Value="Wrap"/>
+            <Setter Property="Margin" Value="0,3,0,0"/>
+        </Style>
+        <Style TargetType="GroupBox">
+            <Setter Property="Padding" Value="10"/>
+            <Setter Property="Margin" Value="0,0,0,12"/>
+        </Style>
+        <Style x:Key="ActionButton" TargetType="Button">
+            <Setter Property="Padding" Value="12,6"/>
+            <Setter Property="Margin" Value="0,0,8,6"/>
+        </Style>
+    </Window.Resources>
+
+    <Grid Margin="12">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TabControl Grid.Row="0">
+
+            <!-- ===================== Источник и захват ===================== -->
+            <TabItem Header="Source and capture">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel Margin="12">
+
+                        <GroupBox Header="Source">
+                            <StackPanel>
+                                <TextBlock Text="Audio device" Style="{StaticResource FieldLabel}" Margin="0,0,0,3"/>
+                                <ComboBox ItemsSource="{Binding Devices}" SelectedItem="{Binding SelectedDevice}"
+                                          DisplayMemberPath="Display" Height="30"/>
+                                <TextBlock Text="{Binding DeviceFormatText}" Style="{StaticResource Hint}"/>
+                                <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
+                                    <Button Content="Refresh devices" Command="{Binding RefreshDevicesCommand}" Style="{StaticResource ActionButton}"/>
+                                    <Button Content="Probe supported formats" Command="{Binding ProbeFormatsCommand}" Style="{StaticResource ActionButton}"
+                                            ToolTip="Shows which sample rates and bit depths the driver accepts (result appears on the Test tab)."/>
+                                </StackPanel>
+                                <TextBlock Style="{StaticResource Hint}"
+                                           Text="This device is also used by the Home page. 'Input' is a microphone (for example the iVCam microphone); 'System audio' records what the PC plays."/>
+                            </StackPanel>
+                        </GroupBox>
+
+                        <GroupBox Header="Capture (affects whether samples are lost)">
+                            <StackPanel>
+                                <TextBlock Text="Capture mode" Style="{StaticResource FieldLabel}" Margin="0,0,0,3"/>
+                                <ComboBox ItemsSource="{Binding Apis}" DisplayMemberPath="Label" SelectedValuePath="Value"
+                                          SelectedValue="{Binding Api}" Height="30"
+                                          ToolTip="Applies to microphones. System audio always uses WASAPI loopback."/>
+
+                                <TextBlock Style="{StaticResource FieldLabel}">
+                                    <Run Text="Buffer: "/><Run Text="{Binding BufferMs, Mode=OneWay}"/><Run Text=" ms"/>
+                                </TextBlock>
+                                <Slider Minimum="10" Maximum="500" TickFrequency="10" IsSnapToTickEnabled="True"
+                                        Value="{Binding BufferMs}"/>
+                                <TextBlock Style="{StaticResource Hint}"
+                                           Text="A larger buffer survives short stalls (network drivers such as iVCam, a busy CPU) at the cost of latency. Try 100-300 ms if the sound crackles."/>
+
+                                <CheckBox Content="Request a specific driver format (instead of the device's own)" Margin="0,12,0,0"
+                                          IsChecked="{Binding RequestCustomDriverFormat}"/>
+                                <Grid Margin="20,6,0,0" IsEnabled="{Binding RequestCustomDriverFormat}">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Grid.Column="0" Margin="0,0,8,0">
+                                        <TextBlock Text="Sample rate" Style="{StaticResource FieldLabel}" Margin="0,0,0,3"/>
+                                        <ComboBox ItemsSource="{Binding DriverSampleRates}" DisplayMemberPath="Label" SelectedValuePath="Value"
+                                                  SelectedValue="{Binding DriverSampleRate}" Height="28"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="1" Margin="0,0,8,0">
+                                        <TextBlock Text="Bit depth" Style="{StaticResource FieldLabel}" Margin="0,0,0,3"/>
+                                        <ComboBox ItemsSource="{Binding BitDepths}" DisplayMemberPath="Label" SelectedValuePath="Value"
+                                                  SelectedValue="{Binding DriverBitDepth}" Height="28"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="2">
+                                        <TextBlock Text="Channels" Style="{StaticResource FieldLabel}" Margin="0,0,0,3"/>
+                                        <ComboBox ItemsSource="{Binding DriverChannelOptions}" DisplayMemberPath="Label" SelectedValuePath="Value"
+                                                  SelectedValue="{Binding DriverChannels}" Height="28"/>
+                                    </StackPanel>
+                                </Grid>
+                                <TextBlock Style="{StaticResource Hint}"
+                                           Text="Off = use the format shown above (recommended). In shared mode Windows converts to the requested format itself; in exclusive mode the driver must accept it, otherwise the app falls back to shared mode and writes a note to the log."/>
+
+                                <CheckBox Content="Boost capture thread priority (MMCSS 'Pro Audio') and reduce GC pauses" Margin="0,12,0,0"
+                                          IsChecked="{Binding BoostThreadPriority}"/>
+                                <CheckBox Content="Lower ffmpeg video encoder priority while recording" Margin="0,6,0,0"
+                                          IsChecked="{Binding LowerEncoderPriority}"/>
+                            </StackPanel>
+                        </GroupBox>
+
+                        <GroupBox Header="Processing and output format">
+                            <StackPanel>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel Grid.Column="0" Margin="0,0,8,0">
+                                        <TextBlock Text="Output sample rate" Style="{StaticResource FieldLabel}" Margin="0,0,0,3"/>
+                                        <ComboBox ItemsSource="{Binding OutputSampleRates}" DisplayMemberPath="Label" SelectedValuePath="Value"
+                                                  SelectedValue="{Binding OutputSampleRate}" Height="28"/>
+                                        <TextBlock Text="Output bit depth" Style="{StaticResource FieldLabel}"/>
+                                        <ComboBox ItemsSource="{Binding BitDepths}" DisplayMemberPath="Label" SelectedValuePath="Value"
+                                                  SelectedValue="{Binding OutputBitDepth}" Height="28"/>
+                                        <CheckBox Content="Dither when reducing to 16-bit" Margin="0,10,0,0" IsChecked="{Binding Dither}"/>
+                                    </StackPanel>
+                                    <StackPanel Grid.Column="1">
+                                        <TextBlock Text="Channels" Style="{StaticResource FieldLabel}" Margin="0,0,0,3"/>
+                                        <ComboBox ItemsSource="{Binding ChannelModes}" DisplayMemberPath="Label" SelectedValuePath="Value"
+                                                  SelectedValue="{Binding ChannelMode}" Height="28"
+                                                  ToolTip="If a headset microphone is only on one channel, pick that channel instead of Mono (mixing halves the level)."/>
+                                        <TextBlock Text="Low-cut filter (removes rumble)" Style="{StaticResource FieldLabel}"/>
+                                        <ComboBox ItemsSource="{Binding HighPassOptions}" DisplayMemberPath="Label" SelectedValuePath="Value"
+                                                  SelectedValue="{Binding HighPassHz}" Height="28"/>
+                                        <TextBlock Text="AAC bitrate in the final MP4" Style="{StaticResource FieldLabel}"/>
+                                        <ComboBox ItemsSource="{Binding AacBitrates}" DisplayMemberPath="Label" SelectedValuePath="Value"
+                                                  SelectedValue="{Binding AacBitrateKbps}" Height="28"/>
+                                    </StackPanel>
+                                </Grid>
+                                <TextBlock Style="{StaticResource FieldLabel}">
+                                    <Run Text="Input gain: "/><Run Text="{Binding InputGainDb, Mode=OneWay, StringFormat={}{0:0.#}}"/><Run Text=" dB"/>
+                                </TextBlock>
+                                <Slider Minimum="-20" Maximum="20" TickFrequency="0.5" IsSnapToTickEnabled="True"
+                                        Value="{Binding InputGainDb}"/>
+                                <TextBlock Style="{StaticResource Hint}"
+                                           Text="Conversion happens in a separate thread, so a different output rate or format does not endanger capture. Settings are saved automatically and used by the next recording."/>
+                            </StackPanel>
+                        </GroupBox>
+
+                        <Button Content="Reset all audio settings to defaults" Command="{Binding ResetToDefaultsCommand}"
+                                HorizontalAlignment="Left" Style="{StaticResource ActionButton}"/>
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
+            <!-- ===================== Эквалайзер ===================== -->
+            <TabItem Header="Equalizer">
+                <StackPanel Margin="16">
+                    <StackPanel Orientation="Horizontal">
+                        <CheckBox Content="Enable equalizer" IsChecked="{Binding EqEnabled}" VerticalAlignment="Center" FontWeight="SemiBold"/>
+                        <TextBlock Text="Preset:" VerticalAlignment="Center" Margin="24,0,6,0"/>
+                        <ComboBox ItemsSource="{Binding EqPresetNames}" SelectedItem="{Binding EqPreset}" Width="170" Height="28"/>
+                        <Button Content="Reset to flat" Command="{Binding ResetEqualizerCommand}" Margin="12,0,0,0" Padding="12,4"/>
+                    </StackPanel>
+
+                    <ItemsControl ItemsSource="{Binding Bands}" Margin="0,18,0,0" IsEnabled="{Binding EqEnabled}">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate><StackPanel Orientation="Horizontal" HorizontalAlignment="Center"/></ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <StackPanel Width="62" Margin="2,0">
+                                    <TextBlock Text="{Binding GainDb, StringFormat={}{0:+0.#;-0.#;0} dB}" HorizontalAlignment="Center" FontSize="11"/>
+                                    <Slider Orientation="Vertical" Height="230" Minimum="-12" Maximum="12" TickFrequency="1"
+                                            TickPlacement="BottomRight" IsSnapToTickEnabled="True" HorizontalAlignment="Center"
+                                            Value="{Binding GainDb}" Margin="0,6"/>
+                                    <TextBlock Text="{Binding Label}" HorizontalAlignment="Center" FontWeight="SemiBold"/>
+                                </StackPanel>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                    <TextBlock HorizontalAlignment="Center" Text="Band centre frequency, Hz" Style="{StaticResource Hint}"/>
+                    <TextBlock Style="{StaticResource Hint}" Margin="0,14,0,0"
+                               Text="The equalizer is applied to video recordings and to test recordings. Bands above about 45% of the source sample rate are skipped. Tip: record a test with 'Save raw copy', then change the equalizer and press 'Re-process raw with current settings' on the Test tab to hear the difference without re-recording."/>
+                </StackPanel>
+            </TabItem>
+
+            <!-- ===================== Тест ===================== -->
+            <TabItem Header="Test and diagnostics">
+                <Grid Margin="12">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+
+                    <!-- Параметры и кнопки -->
+                    <StackPanel Grid.Row="0">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/>
+                            </Grid.ColumnDefinitions>
+                            <StackPanel Grid.Column="0" Margin="0,0,8,0">
+                                <TextBlock Text="Stop" Style="{StaticResource FieldLabel}" Margin="0,0,0,3"/>
+                                <ComboBox ItemsSource="{Binding AutoStopOptions}" DisplayMemberPath="Label" SelectedValuePath="Value"
+                                          SelectedValue="{Binding AutoStopSeconds}" Height="28" IsEnabled="{Binding IsIdle}"/>
+                            </StackPanel>
+                            <StackPanel Grid.Column="1" Margin="0,0,8,0">
+                                <TextBlock Text="Also convert to" Style="{StaticResource FieldLabel}" Margin="0,0,0,3"/>
+                                <ComboBox ItemsSource="{Binding Containers}" DisplayMemberPath="Label" SelectedValuePath="Value"
+                                          SelectedValue="{Binding TestContainer}" Height="28" IsEnabled="{Binding IsIdle}"
+                                          ToolTip="Conversion uses ffmpeg. The WAV file is always kept."/>
+                            </StackPanel>
+                            <CheckBox Grid.Column="2" Content="Save raw copy" VerticalAlignment="Bottom" Margin="0,0,0,6"
+                                      IsChecked="{Binding SaveRawCopy}" IsEnabled="{Binding IsIdle}"
+                                      ToolTip="Also saves the unprocessed device stream. If the raw file crackles, the problem is in the driver/capture, not in processing."/>
+                        </Grid>
+                        <WrapPanel Margin="0,10,0,0">
+                            <Button Content="Record test (audio only)" Command="{Binding StartTestCommand}" IsEnabled="{Binding IsIdle}"
+                                    Background="#CC0000" Foreground="White" FontWeight="Bold" Style="{StaticResource ActionButton}"/>
+                            <Button Content="Stop" Command="{Binding StopTestCommand}" IsEnabled="{Binding IsTesting}"
+                                    Style="{StaticResource ActionButton}"/>
+                            <Button Content="Play processed" Command="{Binding PlayProcessedCommand}" IsEnabled="{Binding HasProcessed}"
+                                    Style="{StaticResource ActionButton}"/>
+                            <Button Content="Play raw" Command="{Binding PlayRawCommand}" IsEnabled="{Binding HasRaw}"
+                                    Style="{StaticResource ActionButton}"/>
+                            <Button Content="Re-process raw with current settings" Command="{Binding ReprocessRawCommand}"
+                                    IsEnabled="{Binding HasRaw}" Style="{StaticResource ActionButton}"/>
+                            <Button Content="Analyze file..." Command="{Binding AnalyzeFileCommand}" Style="{StaticResource ActionButton}"
+                                    ToolTip="Analyze any audio or video file (for example a Bandicam recording) and compare the numbers."/>
+                            <Button Content="Open test folder" Command="{Binding OpenTestFolderCommand}" Style="{StaticResource ActionButton}"/>
+                        </WrapPanel>
+                    </StackPanel>
+
+                    <!-- Индикаторы -->
+                    <Border Grid.Row="1" Background="White" BorderBrush="#DDD" BorderThickness="1" Padding="10" Margin="0,4,0,8">
+                        <StackPanel>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="50"/><ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+                                </Grid.RowDefinitions>
+                                <TextBlock Grid.Row="0" Text="Peak" VerticalAlignment="Center"/>
+                                <ProgressBar Grid.Row="0" Grid.Column="1" Height="14" Minimum="0" Maximum="100" Value="{Binding PeakPercent}" Margin="0,2"/>
+                                <TextBlock Grid.Row="1" Text="RMS" VerticalAlignment="Center"/>
+                                <ProgressBar Grid.Row="1" Grid.Column="1" Height="14" Minimum="0" Maximum="100" Value="{Binding RmsPercent}" Margin="0,2"/>
+                            </Grid>
+                            <DockPanel Margin="0,6,0,0">
+                                <TextBlock Text="CLIPPING" Foreground="Red" FontWeight="Bold" DockPanel.Dock="Right"
+                                           Visibility="{Binding ClipWarning, Converter={StaticResource BoolToVis}}"/>
+                                <TextBlock Text="{Binding LevelText}" FontFamily="Consolas"/>
+                            </DockPanel>
+                            <TextBlock Text="{Binding StatsText}" FontFamily="Consolas" FontSize="11" Foreground="#444" Margin="0,3,0,0"
+                                       TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </Border>
+
+                    <TextBlock Grid.Row="2" Text="{Binding StatusText}" FontWeight="SemiBold" Margin="0,0,0,6" TextWrapping="Wrap"/>
+
+                    <!-- Результаты -->
+                    <TextBox Grid.Row="3" Text="{Binding ResultText, Mode=OneWay}" IsReadOnly="True" FontFamily="Consolas" FontSize="12"
+                             TextWrapping="NoWrap" AcceptsReturn="True" VerticalScrollBarVisibility="Auto"
+                             HorizontalScrollBarVisibility="Auto" MinHeight="140" Background="White"/>
+                </Grid>
+            </TabItem>
+        </TabControl>
+
+        <TextBlock Grid.Row="1" Margin="2,8,2,0" Style="{StaticResource Hint}"
+                   Text="Changes are saved automatically. The test tab records only audio and does not start the screen recorder."/>
+    </Grid>
+</Window>

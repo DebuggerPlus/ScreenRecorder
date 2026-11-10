@@ -28,7 +28,7 @@ public class FFmpegEncoder
         }
     }
 
-    public void Start(string outputPath, int width, int height, int fps, int bitrate, string? audioDeviceName = null)
+    public void Start(string outputPath, int width, int height, int fps, int bitrate, string? audioDeviceName = null, bool lowPriority = true)
     {
         width = (width / 2) * 2;
         height = (height / 2) * 2;
@@ -56,6 +56,12 @@ public class FFmpegEncoder
         _process.ErrorDataReceived += (s, e) => { if (e.Data != null) _uiLogger.Log($"FFmpeg: {e.Data}"); };
         _process.Start();
         _process.BeginErrorReadLine();
+        if (lowPriority)
+        {
+            // Кодирование не должно отнимать процессорное время у потока захвата звука.
+            try { _process.PriorityClass = ProcessPriorityClass.BelowNormal; }
+            catch (Exception ex) { _uiLogger.Log($"FFmpeg: could not lower priority: {ex.Message}"); }
+        }
     }
 
     public void Stop()

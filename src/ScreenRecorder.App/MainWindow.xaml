@@ -41,6 +41,7 @@
                 
                 <Border Height="2" Background="#444" Margin="10,20"/>
                 
+                <Button Content="Audio Settings" Command="{Binding OpenAudioSettingsCommand}" Style="{StaticResource NavButtonStyle}"/>
                 <Button Content="Test Sync" Command="{Binding OpenSyncTestCommand}" Style="{StaticResource NavButtonStyle}"/>
                 <Button Content="Recordings" Command="{Binding OpenRecordingsWindowCommand}" Style="{StaticResource NavButtonStyle}"/>
             </StackPanel>
@@ -90,7 +91,8 @@
                     <TextBlock Text="Audio Settings" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,10"/>
                     <ComboBox ItemsSource="{Binding AudioDevices}" SelectedItem="{Binding SelectedAudioDevice}"
                               DisplayMemberPath="Name" Height="35" Margin="0,0,0,10"/>
-                    <Button Content="Refresh Audio Sources" Command="{Binding RefreshAudioSourcesCommand}" Height="30" Margin="0,0,0,20"/>
+                    <Button Content="Refresh Audio Sources" Command="{Binding RefreshAudioSourcesCommand}" Height="30" Margin="0,0,0,10"/>
+                    <Button Content="Audio Settings, Equalizer and Test..." Command="{Binding OpenAudioSettingsCommand}" Height="30" Margin="0,0,0,20"/>
                 </StackPanel>
 
                 <!-- Video / Logo Settings View -->

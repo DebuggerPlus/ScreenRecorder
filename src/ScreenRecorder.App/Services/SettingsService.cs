@@ -15,6 +15,7 @@ public class AppSettings
     public float LogoScale { get; set; } = 1.0f;
     public string? LogoPath { get; set; }
     public LogoPosition LogoPosition { get; set; } = LogoPosition.TopRight;
+    public AudioCaptureSettings Audio { get; set; } = new();
 }
 
 public class SettingsService
@@ -39,10 +40,17 @@ public class SettingsService
             }
         }
         catch { Current = new AppSettings(); }
+        Current.Audio ??= new AudioCaptureSettings();
+        Current.Audio.Normalize();
+        if (string.IsNullOrWhiteSpace(Current.OutputFolder))
+            Current.OutputFolder = new AppSettings().OutputFolder;
     }
+
+    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
     public void Save()
     {
-        File.WriteAllText(_path, JsonSerializer.Serialize(Current));
+        try { File.WriteAllText(_path, JsonSerializer.Serialize(Current, JsonOptions)); }
+        catch { /* папка программы может быть недоступна для записи: настройки просто не сохранятся */ }
     }
 }

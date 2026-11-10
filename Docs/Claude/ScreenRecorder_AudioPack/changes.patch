@@ -1,0 +1,3071 @@
+diff --git a/ScreenRecorder.slnx b/ScreenRecorder.slnx
+index 72ab3c9..c0bfb0b 100644
+--- a/ScreenRecorder.slnx
++++ b/ScreenRecorder.slnx
+@@ -4,4 +4,7 @@
+     <Project Path="src/ScreenRecorder.Core/ScreenRecorder.Core.csproj" />
+     <Project Path="src/ScreenRecorder.Infrastructure/ScreenRecorder.Infrastructure.csproj" />
+   </Folder>
++  <Folder Name="/tools/">
++    <Project Path="tools/AudioChainSelfTest/AudioChainSelfTest.csproj" />
++  </Folder>
+ </Solution>
+diff --git a/THIRD-PARTY-NOTICES.md b/THIRD-PARTY-NOTICES.md
+index f9da830..20802ac 100644
+--- a/THIRD-PARTY-NOTICES.md
++++ b/THIRD-PARTY-NOTICES.md
+@@ -10,7 +10,8 @@ This project uses several third-party libraries and components. This file contai
+ ## 2. NAudio
+ * **Website:** https://github.com/naudio/NAudio
+ * **License:** MIT License
+-* **Usage:** Used for WASAPI audio loopback capture (system sound) and microphone input.
++* **Usage:** Used for WASAPI audio loopback capture (system sound) and microphone input, and for audio processing (biquad filters for the equalizer, WDL resampler) and WAV reading/writing in the audio settings and test tools.
++* **Note:** NAudio.Core bundles a port of the WDL resampler by Cockos (zlib-style permissive license).
+ 
+ ## 3. CommunityToolkit.Mvvm
+ * **Website:** https://github.com/CommunityToolkit/dotnet
+diff --git a/src/ScreenRecorder.App/App.xaml.cs b/src/ScreenRecorder.App/App.xaml.cs
+index 70e73e4..ab189ac 100644
+--- a/src/ScreenRecorder.App/App.xaml.cs
++++ b/src/ScreenRecorder.App/App.xaml.cs
+@@ -35,6 +35,10 @@ public partial class App : Application
+         services.AddSingleton<FFmpegEncoder>();
+         services.AddSingleton<IRecordingSession, RecordingSession>();
+         services.AddSingleton<ICaptureSourceProvider, WindowsGraphicsCaptureSourceProvider>();
++        services.AddSingleton<IAudioDeviceService, AudioDeviceService>();
++        services.AddSingleton<IAudioTestService, AudioTestService>();
++        services.AddTransient<AudioSettingsViewModel>();
++        services.AddSingleton<Func<AudioSettingsViewModel>>(sp => () => sp.GetRequiredService<AudioSettingsViewModel>());
+         services.AddTransient<MainViewModel>();
+         services.AddTransient<MainWindow>();
+         services.AddTransient<LogWindow>();
+diff --git a/src/ScreenRecorder.App/MainWindow.xaml b/src/ScreenRecorder.App/MainWindow.xaml
+index d9425fd..8913d8c 100644
+--- a/src/ScreenRecorder.App/MainWindow.xaml
++++ b/src/ScreenRecorder.App/MainWindow.xaml
+@@ -41,6 +41,7 @@
+                 
+                 <Border Height="2" Background="#444" Margin="10,20"/>
+                 
++                <Button Content="Audio Settings" Command="{Binding OpenAudioSettingsCommand}" Style="{StaticResource NavButtonStyle}"/>
+                 <Button Content="Test Sync" Command="{Binding OpenSyncTestCommand}" Style="{StaticResource NavButtonStyle}"/>
+                 <Button Content="Recordings" Command="{Binding OpenRecordingsWindowCommand}" Style="{StaticResource NavButtonStyle}"/>
+             </StackPanel>
+@@ -90,7 +91,8 @@
+                     <TextBlock Text="Audio Settings" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,10"/>
+                     <ComboBox ItemsSource="{Binding AudioDevices}" SelectedItem="{Binding SelectedAudioDevice}"
+                               DisplayMemberPath="Name" Height="35" Margin="0,0,0,10"/>
+-                    <Button Content="Refresh Audio Sources" Command="{Binding RefreshAudioSourcesCommand}" Height="30" Margin="0,0,0,20"/>
++                    <Button Content="Refresh Audio Sources" Command="{Binding RefreshAudioSourcesCommand}" Height="30" Margin="0,0,0,10"/>
++                    <Button Content="Audio Settings, Equalizer and Test..." Command="{Binding OpenAudioSettingsCommand}" Height="30" Margin="0,0,0,20"/>
+                 </StackPanel>
+ 
+                 <!-- Video / Logo Settings View -->
+diff --git a/src/ScreenRecorder.App/Services/SettingsService.cs b/src/ScreenRecorder.App/Services/SettingsService.cs
+index 5758b8c..ebba0c1 100644
+--- a/src/ScreenRecorder.App/Services/SettingsService.cs
++++ b/src/ScreenRecorder.App/Services/SettingsService.cs
+@@ -15,6 +15,7 @@ public class AppSettings
+     public float LogoScale { get; set; } = 1.0f;
+     public string? LogoPath { get; set; }
+     public LogoPosition LogoPosition { get; set; } = LogoPosition.TopRight;
++    public AudioCaptureSettings Audio { get; set; } = new();
+ }
+ 
+ public class SettingsService
+@@ -39,10 +40,17 @@ public class SettingsService
+             }
+         }
+         catch { Current = new AppSettings(); }
++        Current.Audio ??= new AudioCaptureSettings();
++        Current.Audio.Normalize();
++        if (string.IsNullOrWhiteSpace(Current.OutputFolder))
++            Current.OutputFolder = new AppSettings().OutputFolder;
+     }
+ 
++    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
++
+     public void Save()
+     {
+-        File.WriteAllText(_path, JsonSerializer.Serialize(Current));
++        try { File.WriteAllText(_path, JsonSerializer.Serialize(Current, JsonOptions)); }
++        catch { /* папка программы может быть недоступна для записи: настройки просто не сохранятся */ }
+     }
+ }
+\ No newline at end of file
+diff --git a/src/ScreenRecorder.App/ViewModels/AudioSettingsViewModel.cs b/src/ScreenRecorder.App/ViewModels/AudioSettingsViewModel.cs
+new file mode 100644
+index 0000000..fdd5140
+--- /dev/null
++++ b/src/ScreenRecorder.App/ViewModels/AudioSettingsViewModel.cs
+@@ -0,0 +1,455 @@
++using CommunityToolkit.Mvvm.ComponentModel;
++using CommunityToolkit.Mvvm.Input;
++using ScreenRecorder.App.Services;
++using ScreenRecorder.Core.Interfaces;
++using ScreenRecorder.Core.Models;
++using System;
++using System.Collections.Generic;
++using System.Collections.ObjectModel;
++using System.ComponentModel;
++using System.Diagnostics;
++using System.IO;
++using System.Linq;
++using System.Threading.Tasks;
++using System.Windows;
++using System.Windows.Threading;
++
++namespace ScreenRecorder.App.ViewModels;
++
++/// <summary>Пункт выпадающего списка: подпись + значение.</summary>
++public sealed record Option<T>(string Label, T Value);
++
++public sealed class AudioDeviceItem
++{
++    public AudioDevice Device { get; }
++    public AudioDeviceItem(AudioDevice device) => Device = device;
++    public string Display => (Device.IsInput ? "[Input] " : "[System audio / loopback] ") + Device.Name;
++}
++
++public partial class EqBandViewModel : ObservableObject
++{
++    public string Label { get; }
++    [ObservableProperty] private float _gainDb;
++    public EqBandViewModel(string label) => Label = label;
++}
++
++/// <summary>
++/// Окно настроек звука: источник, формат захвата, обработка, эквалайзер и тестовая запись без видео.
++/// Все изменения сразу сохраняются в settings.json и используются при следующей записи.
++/// </summary>
++public partial class AudioSettingsViewModel : ObservableObject
++{
++    private readonly SettingsService _settings;
++    private readonly IAudioDeviceService _devices;
++    private readonly IAudioTestService _test;
++    private readonly ILoggerService _logger;
++    private readonly DispatcherTimer _saveTimer;
++    private readonly DispatcherTimer _statsTimer;
++    private bool _loading;
++    private bool _applyingPreset;
++    private bool _deviceTouched; // пользователь сам менял устройство в этом окне
++    private DateTime _testStartedAt;
++
++    private static readonly HashSet<string> PersistedProperties = new()
++    {
++        nameof(Api), nameof(BufferMs), nameof(RequestCustomDriverFormat), nameof(DriverSampleRate),
++        nameof(DriverBitDepth), nameof(DriverChannels), nameof(BoostThreadPriority), nameof(LowerEncoderPriority),
++        nameof(OutputSampleRate), nameof(OutputBitDepth), nameof(ChannelMode), nameof(InputGainDb),
++        nameof(HighPassHz), nameof(Dither), nameof(AacBitrateKbps), nameof(EqEnabled), nameof(EqPreset),
++        nameof(SaveRawCopy), nameof(TestContainer), nameof(AutoStopSeconds)
++    };
++
++    // ----- Списки выбора -----
++    public ObservableCollection<AudioDeviceItem> Devices { get; } = new();
++    public ObservableCollection<EqBandViewModel> Bands { get; } = new();
++
++    public IReadOnlyList<Option<AudioCaptureApi>> Apis { get; } = new[]
++    {
++        new Option<AudioCaptureApi>("WASAPI shared, event-driven (recommended)", AudioCaptureApi.WasapiEvent),
++        new Option<AudioCaptureApi>("WASAPI shared, polling (try for iVCam / virtual drivers)", AudioCaptureApi.WasapiPolling),
++        new Option<AudioCaptureApi>("WASAPI exclusive (driver must accept the format)", AudioCaptureApi.WasapiExclusive),
++    };
++    public IReadOnlyList<Option<int>> DriverSampleRates { get; } =
++        AudioCaptureSettings.AllowedDriverRates.Select(r => new Option<int>($"{r} Hz", r)).ToList();
++    public IReadOnlyList<Option<int>> DriverChannelOptions { get; } = new[]
++        { new Option<int>("Mono (1 ch)", 1), new Option<int>("Stereo (2 ch)", 2) };
++    public IReadOnlyList<Option<AudioBitDepth>> BitDepths { get; } = new[]
++    {
++        new Option<AudioBitDepth>("16-bit PCM", AudioBitDepth.Pcm16),
++        new Option<AudioBitDepth>("24-bit PCM", AudioBitDepth.Pcm24),
++        new Option<AudioBitDepth>("32-bit float", AudioBitDepth.Float32),
++    };
++    public IReadOnlyList<Option<int>> OutputSampleRates { get; } = new[]
++    {
++        new Option<int>("Same as source", 0), new Option<int>("8000 Hz", 8000), new Option<int>("16000 Hz", 16000),
++        new Option<int>("22050 Hz", 22050), new Option<int>("32000 Hz", 32000), new Option<int>("44100 Hz", 44100),
++        new Option<int>("48000 Hz", 48000), new Option<int>("88200 Hz", 88200), new Option<int>("96000 Hz", 96000),
++    };
++    public IReadOnlyList<Option<AudioChannelMode>> ChannelModes { get; } = new[]
++    {
++        new Option<AudioChannelMode>("Auto (as source, max 2)", AudioChannelMode.Auto),
++        new Option<AudioChannelMode>("Mono (mix all channels)", AudioChannelMode.Mono),
++        new Option<AudioChannelMode>("Stereo", AudioChannelMode.Stereo),
++        new Option<AudioChannelMode>("Left channel only", AudioChannelMode.LeftOnly),
++        new Option<AudioChannelMode>("Right channel only", AudioChannelMode.RightOnly),
++    };
++    public IReadOnlyList<Option<int>> HighPassOptions { get; } = new[]
++    {
++        new Option<int>("Off", 0), new Option<int>("60 Hz", 60), new Option<int>("80 Hz", 80),
++        new Option<int>("100 Hz", 100), new Option<int>("150 Hz", 150), new Option<int>("200 Hz", 200),
++    };
++    public IReadOnlyList<Option<int>> AacBitrates { get; } = new[]
++    {
++        new Option<int>("96 kbps", 96), new Option<int>("128 kbps", 128), new Option<int>("160 kbps", 160),
++        new Option<int>("192 kbps", 192), new Option<int>("256 kbps", 256), new Option<int>("320 kbps", 320),
++    };
++    public IReadOnlyList<Option<AudioTestContainer>> Containers { get; } = new[]
++    {
++        new Option<AudioTestContainer>("WAV only", AudioTestContainer.Wav),
++        new Option<AudioTestContainer>("WAV + FLAC", AudioTestContainer.Flac),
++        new Option<AudioTestContainer>("WAV + MP3", AudioTestContainer.Mp3),
++        new Option<AudioTestContainer>("WAV + M4A (AAC)", AudioTestContainer.M4a),
++    };
++    public IReadOnlyList<Option<int>> AutoStopOptions { get; } = new[]
++    {
++        new Option<int>("Until I press Stop", 0), new Option<int>("5 seconds", 5), new Option<int>("10 seconds", 10),
++        new Option<int>("30 seconds", 30), new Option<int>("60 seconds", 60),
++    };
++    public IReadOnlyList<string> EqPresetNames { get; } = EqualizerPresets.Names;
++
++    // ----- Источник -----
++    [ObservableProperty] private AudioDeviceItem? _selectedDevice;
++    [ObservableProperty] private string _deviceFormatText = "";
++
++    // ----- Захват -----
++    [ObservableProperty] private AudioCaptureApi _api;
++    [ObservableProperty] private int _bufferMs;
++    [ObservableProperty] private bool _requestCustomDriverFormat;
++    [ObservableProperty] private int _driverSampleRate;
++    [ObservableProperty] private AudioBitDepth _driverBitDepth;
++    [ObservableProperty] private int _driverChannels;
++    [ObservableProperty] private bool _boostThreadPriority;
++    [ObservableProperty] private bool _lowerEncoderPriority;
++
++    // ----- Обработка -----
++    [ObservableProperty] private int _outputSampleRate;
++    [ObservableProperty] private AudioBitDepth _outputBitDepth;
++    [ObservableProperty] private AudioChannelMode _channelMode;
++    [ObservableProperty] private float _inputGainDb;
++    [ObservableProperty] private int _highPassHz;
++    [ObservableProperty] private bool _dither;
++    [ObservableProperty] private int _aacBitrateKbps;
++
++    // ----- Эквалайзер -----
++    [ObservableProperty] private bool _eqEnabled;
++    [ObservableProperty] private string _eqPreset = "Flat";
++
++    // ----- Тест -----
++    [ObservableProperty] private bool _saveRawCopy = true;
++    [ObservableProperty] private AudioTestContainer _testContainer = AudioTestContainer.Wav;
++    [ObservableProperty] private int _autoStopSeconds;
++    [ObservableProperty, NotifyPropertyChangedFor(nameof(IsIdle))] private bool _isTesting;
++    [ObservableProperty] private double _peakPercent;
++    [ObservableProperty] private double _rmsPercent;
++    [ObservableProperty] private bool _clipWarning;
++    [ObservableProperty] private string _levelText = "Peak -∞ dBFS   RMS -∞ dBFS";
++    [ObservableProperty] private string _statsText = "";
++    [ObservableProperty] private string _statusText = "Ready. Pick a device and press Record test.";
++    [ObservableProperty] private string _resultText = "";
++    [ObservableProperty, NotifyPropertyChangedFor(nameof(HasProcessed))] private string? _lastProcessedPath;
++    [ObservableProperty, NotifyPropertyChangedFor(nameof(HasRaw))] private string? _lastRawPath;
++
++    public bool IsIdle => !IsTesting;
++    public bool HasProcessed => !string.IsNullOrEmpty(LastProcessedPath) && File.Exists(LastProcessedPath);
++    public bool HasRaw => !string.IsNullOrEmpty(LastRawPath) && File.Exists(LastRawPath);
++    public string TestFolder => Path.Combine(_settings.Current.OutputFolder, "AudioTests");
++
++    public AudioSettingsViewModel(SettingsService settings, IAudioDeviceService devices,
++        IAudioTestService test, ILoggerService logger)
++    {
++        _settings = settings;
++        _devices = devices;
++        _test = test;
++        _logger = logger;
++
++        for (int i = 0; i < EqualizerPresets.BandCount; i++)
++        {
++            var band = new EqBandViewModel(EqualizerPresets.BandLabels[i]);
++            band.PropertyChanged += OnBandChanged;
++            Bands.Add(band);
++        }
++
++        _saveTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(400) };
++        _saveTimer.Tick += (s, e) => { _saveTimer.Stop(); ApplyToSettings(); };
++        _statsTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(200) };
++        _statsTimer.Tick += OnStatsTick;
++
++        _test.Level += OnLevel;
++        LoadFromSettings();
++        RefreshDevices();
++    }
++
++    // ----- Загрузка и сохранение -----
++    private void LoadFromSettings()
++    {
++        _loading = true;
++        try
++        {
++            var a = _settings.Current.Audio;
++            a.Normalize();
++            Api = a.Api; BufferMs = a.BufferMs;
++            RequestCustomDriverFormat = a.RequestCustomDriverFormat;
++            DriverSampleRate = a.DriverSampleRate; DriverBitDepth = a.DriverBitDepth; DriverChannels = a.DriverChannels;
++            BoostThreadPriority = a.BoostThreadPriority; LowerEncoderPriority = a.LowerEncoderPriority;
++            OutputSampleRate = a.OutputSampleRate; OutputBitDepth = a.OutputBitDepth; ChannelMode = a.ChannelMode;
++            InputGainDb = a.InputGainDb; HighPassHz = a.HighPassHz; Dither = a.Dither; AacBitrateKbps = a.AacBitrateKbps;
++            EqEnabled = a.Equalizer.Enabled; EqPreset = a.Equalizer.Preset;
++            for (int i = 0; i < Bands.Count; i++) Bands[i].GainDb = a.Equalizer.BandGainsDb[i];
++        }
++        finally { _loading = false; }
++    }
++
++    private void ApplyToSettings()
++    {
++        var a = _settings.Current.Audio;
++        a.Api = Api; a.BufferMs = BufferMs;
++        a.RequestCustomDriverFormat = RequestCustomDriverFormat;
++        a.DriverSampleRate = DriverSampleRate; a.DriverBitDepth = DriverBitDepth; a.DriverChannels = DriverChannels;
++        a.BoostThreadPriority = BoostThreadPriority; a.LowerEncoderPriority = LowerEncoderPriority;
++        a.OutputSampleRate = OutputSampleRate; a.OutputBitDepth = OutputBitDepth; a.ChannelMode = ChannelMode;
++        a.InputGainDb = InputGainDb; a.HighPassHz = HighPassHz; a.Dither = Dither; a.AacBitrateKbps = AacBitrateKbps;
++        a.Equalizer.Enabled = EqEnabled; a.Equalizer.Preset = EqPreset;
++        for (int i = 0; i < Bands.Count; i++) a.Equalizer.BandGainsDb[i] = Bands[i].GainDb;
++        a.Normalize();
++        // Устройство пишем только если его меняли в этом окне: иначе простое открытие окна
++        // могло бы подменить выбор на главной странице (например, "No Audio").
++        if (_deviceTouched && SelectedDevice != null) _settings.Current.LastAudioDevice = SelectedDevice.Device.Name;
++        _settings.Save();
++    }
++
++    private void ScheduleSave() { _saveTimer.Stop(); _saveTimer.Start(); }
++
++    /// <summary>Немедленно сохраняет настройки (перед тестом и при закрытии окна).</summary>
++    public void FlushSave() { _saveTimer.Stop(); ApplyToSettings(); }
++
++    protected override void OnPropertyChanged(PropertyChangedEventArgs e)
++    {
++        base.OnPropertyChanged(e);
++        if (_loading || e.PropertyName == null) return;
++        if (PersistedProperties.Contains(e.PropertyName)) ScheduleSave();
++    }
++
++    partial void OnSelectedDeviceChanged(AudioDeviceItem? value)
++    {
++        DeviceFormatText = value == null ? "" : _devices.DescribeMixFormat(value.Device.Id);
++        if (!_loading && value != null) { _deviceTouched = true; ScheduleSave(); }
++    }
++
++    // ----- Эквалайзер -----
++    private void OnBandChanged(object? sender, PropertyChangedEventArgs e)
++    {
++        if (_loading || _applyingPreset) return;
++        if (e.PropertyName == nameof(EqBandViewModel.GainDb))
++        {
++            EqPreset = EqualizerPresets.Custom;
++            ScheduleSave();
++        }
++    }
++
++    partial void OnEqPresetChanged(string value)
++    {
++        if (_loading || _applyingPreset) return;
++        if (EqualizerPresets.All.TryGetValue(value, out var gains))
++        {
++            _applyingPreset = true;
++            try { for (int i = 0; i < Bands.Count; i++) Bands[i].GainDb = gains[i]; }
++            finally { _applyingPreset = false; }
++            if (value != "Flat") EqEnabled = true;
++        }
++    }
++
++    [RelayCommand] private void ResetEqualizer() => EqPreset = "Flat";
++
++    // ----- Устройства -----
++    [RelayCommand]
++    private void RefreshDevices()
++    {
++        string? keepId = SelectedDevice?.Device.Id;
++        string? keepName = SelectedDevice?.Device.Name ?? _settings.Current.LastAudioDevice;
++        _loading = true;
++        try
++        {
++            Devices.Clear();
++            foreach (var d in _devices.GetDevices()) Devices.Add(new AudioDeviceItem(d));
++            SelectedDevice = Devices.FirstOrDefault(d => d.Device.Id == keepId)
++                          ?? Devices.FirstOrDefault(d => d.Device.Name == keepName)
++                          ?? Devices.FirstOrDefault();
++        }
++        finally { _loading = false; }
++        if (SelectedDevice != null) DeviceFormatText = _devices.DescribeMixFormat(SelectedDevice.Device.Id);
++    }
++
++    [RelayCommand]
++    private async Task ProbeFormatsAsync()
++    {
++        if (SelectedDevice == null) { StatusText = "Select a device first."; return; }
++        StatusText = "Probing device formats...";
++        ResultText = await _devices.ProbeFormatsAsync(SelectedDevice.Device.Id);
++        StatusText = "Probe finished.";
++    }
++
++    [RelayCommand]
++    private void ResetToDefaults()
++    {
++        if (MessageBox.Show("Reset all audio settings to defaults?", "Audio settings",
++                MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes) return;
++        _settings.Current.Audio = new AudioCaptureSettings();
++        _settings.Save();
++        LoadFromSettings();
++    }
++
++    // ----- Тестовая запись -----
++    [RelayCommand]
++    private async Task StartTestAsync()
++    {
++        if (IsTesting) return;
++        if (SelectedDevice == null) { StatusText = "Select a device first."; return; }
++
++        FlushSave();
++        ClipWarning = false; PeakPercent = 0; RmsPercent = 0; StatsText = "";
++        StatusText = "Starting...";
++        var options = new AudioTestOptions(SelectedDevice.Device.Id, TestFolder,
++            _settings.Current.Audio.Clone(), SaveRawCopy, TestContainer);
++
++        string? error = await _test.StartAsync(options);
++        if (error != null)
++        {
++            StatusText = "Could not start: " + error;
++            ResultText = "ERROR: " + error;
++            return;
++        }
++        _testStartedAt = DateTime.Now;
++        IsTesting = true;
++        _statsTimer.Start();
++        StatusText = "Recording test... speak into the microphone, then press Stop.";
++    }
++
++    [RelayCommand]
++    private async Task StopTestAsync()
++    {
++        if (!IsTesting) return;
++        _statsTimer.Stop();
++        StatusText = "Finishing and analysing...";
++        var r = await _test.StopAsync();
++        IsTesting = false;
++        PeakPercent = 0; RmsPercent = 0;
++
++        LastProcessedPath = r.ProcessedPath;
++        LastRawPath = r.RawPath;
++        ResultText = r.ToText();
++        StatusText = r.Error == null ? "Test finished. Use Play buttons to listen." : "Test finished with errors, see results.";
++        RefreshFileButtons();
++    }
++
++    [RelayCommand]
++    private async Task ReprocessRawAsync()
++    {
++        if (!HasRaw) { StatusText = "Record a test with 'Save raw copy' first."; return; }
++        FlushSave();
++        StatusText = "Applying current settings to the raw recording...";
++        var r = await _test.ReprocessAsync(LastRawPath!, _settings.Current.Audio.Clone(), TestContainer);
++        if (r.ProcessedPath != null) LastProcessedPath = r.ProcessedPath;
++        ResultText = "Raw recording re-processed with the current settings:" + Environment.NewLine + r.ToText();
++        StatusText = r.Error == null ? "Done. Press 'Play processed' to listen." : "Re-processing failed, see results.";
++        RefreshFileButtons();
++    }
++
++    [RelayCommand]
++    private async Task AnalyzeFileAsync()
++    {
++        var dialog = new Microsoft.Win32.OpenFileDialog
++        {
++            Title = "Pick a recording to analyse (e.g. a Bandicam file to compare)",
++            Filter = "Audio/video|*.wav;*.mp4;*.m4a;*.mp3;*.flac;*.mkv;*.avi;*.ogg|All files|*.*"
++        };
++        if (dialog.ShowDialog() != true) return;
++        StatusText = "Analysing " + Path.GetFileName(dialog.FileName) + "...";
++        try
++        {
++            var a = await _test.AnalyzeFileAsync(dialog.FileName);
++            ResultText = a.ToText() + Environment.NewLine + ResultText;
++            StatusText = "Analysis finished.";
++        }
++        catch (Exception ex)
++        {
++            ResultText = "Analysis failed: " + ex.Message + Environment.NewLine + ResultText;
++            StatusText = "Analysis failed.";
++        }
++    }
++
++    [RelayCommand] private void PlayProcessed() => OpenFile(LastProcessedPath);
++    [RelayCommand] private void PlayRaw() => OpenFile(LastRawPath);
++
++    [RelayCommand]
++    private void OpenTestFolder()
++    {
++        try
++        {
++            Directory.CreateDirectory(TestFolder);
++            Process.Start(new ProcessStartInfo(TestFolder) { UseShellExecute = true });
++        }
++        catch (Exception ex) { StatusText = "Cannot open folder: " + ex.Message; }
++    }
++
++    private void OpenFile(string? path)
++    {
++        try
++        {
++            if (!string.IsNullOrEmpty(path) && File.Exists(path))
++                Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
++        }
++        catch (Exception ex) { StatusText = "Cannot open file: " + ex.Message; }
++    }
++
++    private void RefreshFileButtons()
++    {
++        OnPropertyChanged(nameof(HasProcessed));
++        OnPropertyChanged(nameof(HasRaw));
++    }
++
++    // Вызывается из фонового потока записи ~10 раз в секунду.
++    private void OnLevel(AudioLevel level)
++    {
++        Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
++        {
++            PeakPercent = ToPercent(level.PeakDb);
++            RmsPercent = ToPercent(level.RmsDb);
++            if (level.Clipped > 0) ClipWarning = true;
++            LevelText = $"Peak {Fmt(level.PeakDb)} dBFS   RMS {Fmt(level.RmsDb)} dBFS";
++        }));
++    }
++
++    private static double ToPercent(float db) => Math.Clamp((db + 60.0) / 60.0 * 100.0, 0, 100);
++    private static string Fmt(float db) => db <= -119f ? "-∞" : db.ToString("F1");
++
++    private void OnStatsTick(object? sender, EventArgs e)
++    {
++        var s = _test.GetLiveStats();
++        if (s != null)
++        {
++            StatsText = $"{s.ElapsedSec:F1} s  |  packets {s.Packets}  |  max gap {s.MaxGapMs:F0} ms (avg {s.AvgGapMs:F1})  |  " +
++                        $"late {s.LateCallbacks}  |  queue {s.QueueDepth} (max {s.MaxQueueDepth})";
++        }
++        if (IsTesting && AutoStopSeconds > 0 && (DateTime.Now - _testStartedAt).TotalSeconds >= AutoStopSeconds)
++            _ = StopTestAsync();
++    }
++
++    /// <summary>Вызывается при закрытии окна.</summary>
++    public void Cleanup()
++    {
++        _statsTimer.Stop();
++        _test.Level -= OnLevel;
++        FlushSave();
++        if (IsTesting) _ = _test.StopAsync();
++    }
++}
+diff --git a/src/ScreenRecorder.App/ViewModels/MainViewModel.cs b/src/ScreenRecorder.App/ViewModels/MainViewModel.cs
+index 421ad09..e912286 100644
+--- a/src/ScreenRecorder.App/ViewModels/MainViewModel.cs
++++ b/src/ScreenRecorder.App/ViewModels/MainViewModel.cs
+@@ -27,6 +27,8 @@ public partial class MainViewModel : ObservableObject
+     private string? _lastFilePath;
+     private RecordingOverlayWindow? _overlay;
+     private RegionSelectionWindow? _regionWindow;
++    private readonly Func<AudioSettingsViewModel> _audioVmFactory;
++    private AudioSettingsWindow? _audioWindow;
+ 
+     public ObservableCollection<RecordingFile> SavedFiles { get; } = new();
+     public ObservableCollection<AudioDevice> AudioDevices { get; } = new();
+@@ -44,6 +46,7 @@ public partial class MainViewModel : ObservableObject
+     [ObservableProperty] private string? _logoPath;
+     [ObservableProperty] private LogoPosition _selectedLogoPosition = LogoPosition.TopRight;
+     [ObservableProperty] private string _currentView = "Home"; // Home, General, Video, Image, About
++    [ObservableProperty] private string _outputFolder = "";
+ 
+     [RelayCommand] private void SetView(string view) => CurrentView = view;
+ 
+@@ -68,12 +71,15 @@ public partial class MainViewModel : ObservableObject
+ 
+     public ObservableCollection<CaptureSource> AvailableSources { get; } = new();
+ 
+-    public MainViewModel(IRecordingSession session, ICaptureSourceProvider sourceProvider, ILoggerService logger, SettingsService settings)
++    public MainViewModel(IRecordingSession session, ICaptureSourceProvider sourceProvider, ILoggerService logger, SettingsService settings,
++        Func<AudioSettingsViewModel> audioVmFactory)
+     {
+         _session = session;
+         _sourceProvider = sourceProvider;
+         _logger = logger;
+         _settings = settings;
++        _audioVmFactory = audioVmFactory;
++        OutputFolder = _settings.Current.OutputFolder;
+ 
+         // Загружаем настройки логотипа
+         ShowLogo = _settings.Current.ShowLogo;
+@@ -141,11 +147,13 @@ public partial class MainViewModel : ObservableObject
+     {
+         if (_sourceProvider is WindowsGraphicsCaptureSourceProvider provider)
+         {
++            // Запоминаем выбор до Clear(): иначе сброс на "No Audio" затирал LastAudioDevice в настройках.
++            string? keep = SelectedAudioDevice?.Name ?? _settings.Current.LastAudioDevice;
+             var devices = provider.GetAudioDevices();
+             AudioDevices.Clear();
+             AudioDevices.Add(new AudioDevice("None", "No Audio", false));
+             foreach (var d in devices) AudioDevices.Add(d);
+-            SelectedAudioDevice = AudioDevices.FirstOrDefault();
++            SelectedAudioDevice = AudioDevices.FirstOrDefault(d => d.Name == keep) ?? AudioDevices.FirstOrDefault();
+         }
+     }
+ 
+@@ -181,7 +189,8 @@ public partial class MainViewModel : ObservableObject
+ 
+         string? audioId = SelectedAudioDevice?.Id;
+  
+-        var options = new RecordingOptions(capSource, AudioSourceMode.System, audioId, null, _lastFilePath, 30, 8000, ShowCursor, ShowLogo, LogoPath, LogoText, LogoOpacity, LogoScale, SelectedLogoPosition);
++        var options = new RecordingOptions(capSource, AudioSourceMode.System, audioId, null, _lastFilePath, 30, 8000, ShowCursor, ShowLogo, LogoPath, LogoText, LogoOpacity, LogoScale, SelectedLogoPosition,
++            _settings.Current.Audio.Clone());
+         _logger.Log($"START: {capSource.Width}x{capSource.Height} at {capSource.X},{capSource.Y} Audio ID: {audioId}. Cursor: {ShowCursor}. Logo: {ShowLogo}");
+         await _session.StartAsync(options, CancellationToken.None);
+     }
+@@ -198,9 +207,21 @@ public partial class MainViewModel : ObservableObject
+     [RelayCommand] public void RefreshFiles() {
+         SavedFiles.Clear();
+         if (!Directory.Exists(_settings.Current.OutputFolder)) return;
+-        var files = Directory.GetFiles(_settings.Current.OutputFolder, "*.mp4")
+-            .Select(f => new RecordingFile(f, new FileInfo(f).Name, new FileInfo(f).CreationTime, $"{(new FileInfo(f).Length / 1024.0 / 1024.0):F2} MB"))
+-            .OrderByDescending(f => f.CreatedAt);
++        var root = _settings.Current.OutputFolder;
++        var found = new System.Collections.Generic.List<string>();
++        try { found.AddRange(Directory.GetFiles(root, "*.mp4")); } catch { }
++        // Тестовые записи звука лежат в подпапке AudioTests.
++        var tests = Path.Combine(root, "AudioTests");
++        if (Directory.Exists(tests))
++        {
++            try { found.AddRange(Directory.GetFiles(tests).Where(f => new[] { ".wav", ".flac", ".mp3", ".m4a" }
++                .Contains(Path.GetExtension(f).ToLowerInvariant()))); } catch { }
++        }
++        var files = found
++            .Select(f => new FileInfo(f))
++            .OrderByDescending(fi => fi.CreationTime)
++            .Select(fi => new RecordingFile(fi.FullName, Path.GetRelativePath(root, fi.FullName), fi.CreationTime,
++                $"{(fi.Length / 1024.0 / 1024.0):F2} MB"));
+         foreach (var f in files) SavedFiles.Add(f);
+     }
+ 
+@@ -238,10 +259,77 @@ public partial class MainViewModel : ObservableObject
+         }
+     }
+ 
+-    [RelayCommand] private void OpenSettings() {
+-        var dialog = new Microsoft.Win32.OpenFolderDialog();
+-        if (dialog.ShowDialog() == true) { _settings.Current.OutputFolder = dialog.FolderName; _settings.Save(); RefreshFiles(); }
++    [RelayCommand] private void OpenSettings() => ChooseOutputFolder();
++
++    // ----- Папка для записей по умолчанию -----
++    [RelayCommand]
++    private void ChooseOutputFolder()
++    {
++        var dialog = new Microsoft.Win32.OpenFolderDialog
++        {
++            Title = "Default folder for recordings",
++            InitialDirectory = Directory.Exists(OutputFolder) ? OutputFolder : Environment.GetFolderPath(Environment.SpecialFolder.MyVideos)
++        };
++        if (dialog.ShowDialog() == true) TrySetOutputFolder(dialog.FolderName);
++    }
++
++    [RelayCommand]
++    private void ResetOutputFolder() =>
++        TrySetOutputFolder(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyVideos), "ScreenRecorder"));
++
++    [RelayCommand]
++    private void OpenOutputFolder()
++    {
++        try
++        {
++            Directory.CreateDirectory(OutputFolder);
++            Process.Start(new ProcessStartInfo(OutputFolder) { UseShellExecute = true });
++        }
++        catch (Exception ex) { MessageBox.Show($"Cannot open folder: {ex.Message}"); }
+     }
++
++    /// <summary>Проверяет, что в папку можно писать, и только после этого запоминает её.</summary>
++    private bool TrySetOutputFolder(string path)
++    {
++        try
++        {
++            Directory.CreateDirectory(path);
++            var probe = Path.Combine(path, ".write_test_" + Guid.NewGuid().ToString("N"));
++            File.WriteAllText(probe, "x");
++            File.Delete(probe);
++        }
++        catch (Exception ex)
++        {
++            MessageBox.Show($"Cannot use this folder:\n{path}\n\n{ex.Message}", "Recordings folder");
++            return false;
++        }
++        _settings.Current.OutputFolder = path;
++        _settings.Save();
++        OutputFolder = path;
++        RefreshFiles();
++        _logger.Log($"Recordings folder: {path}");
++        return true;
++    }
++
++    [RelayCommand]
++    private void OpenAudioSettings()
++    {
++        if (_audioWindow != null) { _audioWindow.Activate(); return; }
++        var vm = _audioVmFactory();
++        _audioWindow = new AudioSettingsWindow(vm) { Owner = Application.Current.MainWindow };
++        _audioWindow.Closed += (s, e) =>
++        {
++            _audioWindow = null;
++            // Устройство могли сменить в окне настроек: читаем его ДО перезагрузки списка,
++            // потому что перезагрузка сама перезаписывает LastAudioDevice.
++            var last = _settings.Current.LastAudioDevice;
++            LoadAudioDevices();
++            var dev = AudioDevices.FirstOrDefault(d => d.Name == last);
++            if (dev != null) SelectedAudioDevice = dev;
++        };
++        _audioWindow.Show();
++    }
++
+     [RelayCommand] private async Task RefreshSourcesAsync() {
+         var sources = await _sourceProvider.GetSourcesAsync(SelectedCaptureMode, CancellationToken.None);
+         AvailableSources.Clear();
+diff --git a/src/ScreenRecorder.App/Views/AudioSettingsWindow.xaml b/src/ScreenRecorder.App/Views/AudioSettingsWindow.xaml
+new file mode 100644
+index 0000000..2b24085
+--- /dev/null
++++ b/src/ScreenRecorder.App/Views/AudioSettingsWindow.xaml
+@@ -0,0 +1,266 @@
++<Window x:Class="ScreenRecorder.App.Views.AudioSettingsWindow"
++        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
++        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
++        Title="Audio Settings" Height="760" Width="820" MinHeight="560" MinWidth="700"
++        Background="#F0F0F0" WindowStartupLocation="CenterOwner">
++    <Window.Resources>
++        <BooleanToVisibilityConverter x:Key="BoolToVis"/>
++        <Style x:Key="FieldLabel" TargetType="TextBlock">
++            <Setter Property="Margin" Value="0,8,0,3"/>
++            <Setter Property="FontWeight" Value="SemiBold"/>
++        </Style>
++        <Style x:Key="Hint" TargetType="TextBlock">
++            <Setter Property="Foreground" Value="#666"/>
++            <Setter Property="FontSize" Value="11"/>
++            <Setter Property="TextWrapping" Value="Wrap"/>
++            <Setter Property="Margin" Value="0,3,0,0"/>
++        </Style>
++        <Style TargetType="GroupBox">
++            <Setter Property="Padding" Value="10"/>
++            <Setter Property="Margin" Value="0,0,0,12"/>
++        </Style>
++        <Style x:Key="ActionButton" TargetType="Button">
++            <Setter Property="Padding" Value="12,6"/>
++            <Setter Property="Margin" Value="0,0,8,6"/>
++        </Style>
++    </Window.Resources>
++
++    <Grid Margin="12">
++        <Grid.RowDefinitions>
++            <RowDefinition Height="*"/>
++            <RowDefinition Height="Auto"/>
++        </Grid.RowDefinitions>
++
++        <TabControl Grid.Row="0">
++
++            <!-- ===================== Источник и захват ===================== -->
++            <TabItem Header="Source and capture">
++                <ScrollViewer VerticalScrollBarVisibility="Auto">
++                    <StackPanel Margin="12">
++
++                        <GroupBox Header="Source">
++                            <StackPanel>
++                                <TextBlock Text="Audio device" Style="{StaticResource FieldLabel}" Margin="0,0,0,3"/>
++                                <ComboBox ItemsSource="{Binding Devices}" SelectedItem="{Binding SelectedDevice}"
++                                          DisplayMemberPath="Display" Height="30"/>
++                                <TextBlock Text="{Binding DeviceFormatText}" Style="{StaticResource Hint}"/>
++                                <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
++                                    <Button Content="Refresh devices" Command="{Binding RefreshDevicesCommand}" Style="{StaticResource ActionButton}"/>
++                                    <Button Content="Probe supported formats" Command="{Binding ProbeFormatsCommand}" Style="{StaticResource ActionButton}"
++                                            ToolTip="Shows which sample rates and bit depths the driver accepts (result appears on the Test tab)."/>
++                                </StackPanel>
++                                <TextBlock Style="{StaticResource Hint}"
++                                           Text="This device is also used by the Home page. 'Input' is a microphone (for example the iVCam microphone); 'System audio' records what the PC plays."/>
++                            </StackPanel>
++                        </GroupBox>
++
++                        <GroupBox Header="Capture (affects whether samples are lost)">
++                            <StackPanel>
++                                <TextBlock Text="Capture mode" Style="{StaticResource FieldLabel}" Margin="0,0,0,3"/>
++                                <ComboBox ItemsSource="{Binding Apis}" DisplayMemberPath="Label" SelectedValuePath="Value"
++                                          SelectedValue="{Binding Api}" Height="30"
++                                          ToolTip="Applies to microphones. System audio always uses WASAPI loopback."/>
++
++                                <TextBlock Style="{StaticResource FieldLabel}">
++                                    <Run Text="Buffer: "/><Run Text="{Binding BufferMs, Mode=OneWay}"/><Run Text=" ms"/>
++                                </TextBlock>
++                                <Slider Minimum="10" Maximum="500" TickFrequency="10" IsSnapToTickEnabled="True"
++                                        Value="{Binding BufferMs}"/>
++                                <TextBlock Style="{StaticResource Hint}"
++                                           Text="A larger buffer survives short stalls (network drivers such as iVCam, a busy CPU) at the cost of latency. Try 100-300 ms if the sound crackles."/>
++
++                                <CheckBox Content="Request a specific driver format (instead of the device's own)" Margin="0,12,0,0"
++                                          IsChecked="{Binding RequestCustomDriverFormat}"/>
++                                <Grid Margin="20,6,0,0" IsEnabled="{Binding RequestCustomDriverFormat}">
++                                    <Grid.ColumnDefinitions>
++                                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
++                                    </Grid.ColumnDefinitions>
++                                    <StackPanel Grid.Column="0" Margin="0,0,8,0">
++                                        <TextBlock Text="Sample rate" Style="{StaticResource FieldLabel}" Margin="0,0,0,3"/>
++                                        <ComboBox ItemsSource="{Binding DriverSampleRates}" DisplayMemberPath="Label" SelectedValuePath="Value"
++                                                  SelectedValue="{Binding DriverSampleRate}" Height="28"/>
++                                    </StackPanel>
++                                    <StackPanel Grid.Column="1" Margin="0,0,8,0">
++                                        <TextBlock Text="Bit depth" Style="{StaticResource FieldLabel}" Margin="0,0,0,3"/>
++                                        <ComboBox ItemsSource="{Binding BitDepths}" DisplayMemberPath="Label" SelectedValuePath="Value"
++                                                  SelectedValue="{Binding DriverBitDepth}" Height="28"/>
++                                    </StackPanel>
++                                    <StackPanel Grid.Column="2">
++                                        <TextBlock Text="Channels" Style="{StaticResource FieldLabel}" Margin="0,0,0,3"/>
++                                        <ComboBox ItemsSource="{Binding DriverChannelOptions}" DisplayMemberPath="Label" SelectedValuePath="Value"
++                                                  SelectedValue="{Binding DriverChannels}" Height="28"/>
++                                    </StackPanel>
++                                </Grid>
++                                <TextBlock Style="{StaticResource Hint}"
++                                           Text="Off = use the format shown above (recommended). In shared mode Windows converts to the requested format itself; in exclusive mode the driver must accept it, otherwise the app falls back to shared mode and writes a note to the log."/>
++
++                                <CheckBox Content="Boost capture thread priority (MMCSS 'Pro Audio') and reduce GC pauses" Margin="0,12,0,0"
++                                          IsChecked="{Binding BoostThreadPriority}"/>
++                                <CheckBox Content="Lower ffmpeg video encoder priority while recording" Margin="0,6,0,0"
++                                          IsChecked="{Binding LowerEncoderPriority}"/>
++                            </StackPanel>
++                        </GroupBox>
++
++                        <GroupBox Header="Processing and output format">
++                            <StackPanel>
++                                <Grid>
++                                    <Grid.ColumnDefinitions>
++                                        <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/>
++                                    </Grid.ColumnDefinitions>
++                                    <StackPanel Grid.Column="0" Margin="0,0,8,0">
++                                        <TextBlock Text="Output sample rate" Style="{StaticResource FieldLabel}" Margin="0,0,0,3"/>
++                                        <ComboBox ItemsSource="{Binding OutputSampleRates}" DisplayMemberPath="Label" SelectedValuePath="Value"
++                                                  SelectedValue="{Binding OutputSampleRate}" Height="28"/>
++                                        <TextBlock Text="Output bit depth" Style="{StaticResource FieldLabel}"/>
++                                        <ComboBox ItemsSource="{Binding BitDepths}" DisplayMemberPath="Label" SelectedValuePath="Value"
++                                                  SelectedValue="{Binding OutputBitDepth}" Height="28"/>
++                                        <CheckBox Content="Dither when reducing to 16-bit" Margin="0,10,0,0" IsChecked="{Binding Dither}"/>
++                                    </StackPanel>
++                                    <StackPanel Grid.Column="1">
++                                        <TextBlock Text="Channels" Style="{StaticResource FieldLabel}" Margin="0,0,0,3"/>
++                                        <ComboBox ItemsSource="{Binding ChannelModes}" DisplayMemberPath="Label" SelectedValuePath="Value"
++                                                  SelectedValue="{Binding ChannelMode}" Height="28"
++                                                  ToolTip="If a headset microphone is only on one channel, pick that channel instead of Mono (mixing halves the level)."/>
++                                        <TextBlock Text="Low-cut filter (removes rumble)" Style="{StaticResource FieldLabel}"/>
++                                        <ComboBox ItemsSource="{Binding HighPassOptions}" DisplayMemberPath="Label" SelectedValuePath="Value"
++                                                  SelectedValue="{Binding HighPassHz}" Height="28"/>
++                                        <TextBlock Text="AAC bitrate in the final MP4" Style="{StaticResource FieldLabel}"/>
++                                        <ComboBox ItemsSource="{Binding AacBitrates}" DisplayMemberPath="Label" SelectedValuePath="Value"
++                                                  SelectedValue="{Binding AacBitrateKbps}" Height="28"/>
++                                    </StackPanel>
++                                </Grid>
++                                <TextBlock Style="{StaticResource FieldLabel}">
++                                    <Run Text="Input gain: "/><Run Text="{Binding InputGainDb, Mode=OneWay, StringFormat={}{0:0.#}}"/><Run Text=" dB"/>
++                                </TextBlock>
++                                <Slider Minimum="-20" Maximum="20" TickFrequency="0.5" IsSnapToTickEnabled="True"
++                                        Value="{Binding InputGainDb}"/>
++                                <TextBlock Style="{StaticResource Hint}"
++                                           Text="Conversion happens in a separate thread, so a different output rate or format does not endanger capture. Settings are saved automatically and used by the next recording."/>
++                            </StackPanel>
++                        </GroupBox>
++
++                        <Button Content="Reset all audio settings to defaults" Command="{Binding ResetToDefaultsCommand}"
++                                HorizontalAlignment="Left" Style="{StaticResource ActionButton}"/>
++                    </StackPanel>
++                </ScrollViewer>
++            </TabItem>
++
++            <!-- ===================== Эквалайзер ===================== -->
++            <TabItem Header="Equalizer">
++                <StackPanel Margin="16">
++                    <StackPanel Orientation="Horizontal">
++                        <CheckBox Content="Enable equalizer" IsChecked="{Binding EqEnabled}" VerticalAlignment="Center" FontWeight="SemiBold"/>
++                        <TextBlock Text="Preset:" VerticalAlignment="Center" Margin="24,0,6,0"/>
++                        <ComboBox ItemsSource="{Binding EqPresetNames}" SelectedItem="{Binding EqPreset}" Width="170" Height="28"/>
++                        <Button Content="Reset to flat" Command="{Binding ResetEqualizerCommand}" Margin="12,0,0,0" Padding="12,4"/>
++                    </StackPanel>
++
++                    <ItemsControl ItemsSource="{Binding Bands}" Margin="0,18,0,0" IsEnabled="{Binding EqEnabled}">
++                        <ItemsControl.ItemsPanel>
++                            <ItemsPanelTemplate><StackPanel Orientation="Horizontal" HorizontalAlignment="Center"/></ItemsPanelTemplate>
++                        </ItemsControl.ItemsPanel>
++                        <ItemsControl.ItemTemplate>
++                            <DataTemplate>
++                                <StackPanel Width="62" Margin="2,0">
++                                    <TextBlock Text="{Binding GainDb, StringFormat={}{0:+0.#;-0.#;0} dB}" HorizontalAlignment="Center" FontSize="11"/>
++                                    <Slider Orientation="Vertical" Height="230" Minimum="-12" Maximum="12" TickFrequency="1"
++                                            TickPlacement="BottomRight" IsSnapToTickEnabled="True" HorizontalAlignment="Center"
++                                            Value="{Binding GainDb}" Margin="0,6"/>
++                                    <TextBlock Text="{Binding Label}" HorizontalAlignment="Center" FontWeight="SemiBold"/>
++                                </StackPanel>
++                            </DataTemplate>
++                        </ItemsControl.ItemTemplate>
++                    </ItemsControl>
++                    <TextBlock HorizontalAlignment="Center" Text="Band centre frequency, Hz" Style="{StaticResource Hint}"/>
++                    <TextBlock Style="{StaticResource Hint}" Margin="0,14,0,0"
++                               Text="The equalizer is applied to video recordings and to test recordings. Bands above about 45% of the source sample rate are skipped. Tip: record a test with 'Save raw copy', then change the equalizer and press 'Re-process raw with current settings' on the Test tab to hear the difference without re-recording."/>
++                </StackPanel>
++            </TabItem>
++
++            <!-- ===================== Тест ===================== -->
++            <TabItem Header="Test and diagnostics">
++                <Grid Margin="12">
++                    <Grid.RowDefinitions>
++                        <RowDefinition Height="Auto"/>
++                        <RowDefinition Height="Auto"/>
++                        <RowDefinition Height="Auto"/>
++                        <RowDefinition Height="*"/>
++                    </Grid.RowDefinitions>
++
++                    <!-- Параметры и кнопки -->
++                    <StackPanel Grid.Row="0">
++                        <Grid>
++                            <Grid.ColumnDefinitions>
++                                <ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/>
++                            </Grid.ColumnDefinitions>
++                            <StackPanel Grid.Column="0" Margin="0,0,8,0">
++                                <TextBlock Text="Stop" Style="{StaticResource FieldLabel}" Margin="0,0,0,3"/>
++                                <ComboBox ItemsSource="{Binding AutoStopOptions}" DisplayMemberPath="Label" SelectedValuePath="Value"
++                                          SelectedValue="{Binding AutoStopSeconds}" Height="28" IsEnabled="{Binding IsIdle}"/>
++                            </StackPanel>
++                            <StackPanel Grid.Column="1" Margin="0,0,8,0">
++                                <TextBlock Text="Also convert to" Style="{StaticResource FieldLabel}" Margin="0,0,0,3"/>
++                                <ComboBox ItemsSource="{Binding Containers}" DisplayMemberPath="Label" SelectedValuePath="Value"
++                                          SelectedValue="{Binding TestContainer}" Height="28" IsEnabled="{Binding IsIdle}"
++                                          ToolTip="Conversion uses ffmpeg. The WAV file is always kept."/>
++                            </StackPanel>
++                            <CheckBox Grid.Column="2" Content="Save raw copy" VerticalAlignment="Bottom" Margin="0,0,0,6"
++                                      IsChecked="{Binding SaveRawCopy}" IsEnabled="{Binding IsIdle}"
++                                      ToolTip="Also saves the unprocessed device stream. If the raw file crackles, the problem is in the driver/capture, not in processing."/>
++                        </Grid>
++                        <WrapPanel Margin="0,10,0,0">
++                            <Button Content="Record test (audio only)" Command="{Binding StartTestCommand}" IsEnabled="{Binding IsIdle}"
++                                    Background="#CC0000" Foreground="White" FontWeight="Bold" Style="{StaticResource ActionButton}"/>
++                            <Button Content="Stop" Command="{Binding StopTestCommand}" IsEnabled="{Binding IsTesting}"
++                                    Style="{StaticResource ActionButton}"/>
++                            <Button Content="Play processed" Command="{Binding PlayProcessedCommand}" IsEnabled="{Binding HasProcessed}"
++                                    Style="{StaticResource ActionButton}"/>
++                            <Button Content="Play raw" Command="{Binding PlayRawCommand}" IsEnabled="{Binding HasRaw}"
++                                    Style="{StaticResource ActionButton}"/>
++                            <Button Content="Re-process raw with current settings" Command="{Binding ReprocessRawCommand}"
++                                    IsEnabled="{Binding HasRaw}" Style="{StaticResource ActionButton}"/>
++                            <Button Content="Analyze file..." Command="{Binding AnalyzeFileCommand}" Style="{StaticResource ActionButton}"
++                                    ToolTip="Analyze any audio or video file (for example a Bandicam recording) and compare the numbers."/>
++                            <Button Content="Open test folder" Command="{Binding OpenTestFolderCommand}" Style="{StaticResource ActionButton}"/>
++                        </WrapPanel>
++                    </StackPanel>
++
++                    <!-- Индикаторы -->
++                    <Border Grid.Row="1" Background="White" BorderBrush="#DDD" BorderThickness="1" Padding="10" Margin="0,4,0,8">
++                        <StackPanel>
++                            <Grid>
++                                <Grid.ColumnDefinitions>
++                                    <ColumnDefinition Width="50"/><ColumnDefinition Width="*"/>
++                                </Grid.ColumnDefinitions>
++                                <Grid.RowDefinitions>
++                                    <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
++                                </Grid.RowDefinitions>
++                                <TextBlock Grid.Row="0" Text="Peak" VerticalAlignment="Center"/>
++                                <ProgressBar Grid.Row="0" Grid.Column="1" Height="14" Minimum="0" Maximum="100" Value="{Binding PeakPercent}" Margin="0,2"/>
++                                <TextBlock Grid.Row="1" Text="RMS" VerticalAlignment="Center"/>
++                                <ProgressBar Grid.Row="1" Grid.Column="1" Height="14" Minimum="0" Maximum="100" Value="{Binding RmsPercent}" Margin="0,2"/>
++                            </Grid>
++                            <DockPanel Margin="0,6,0,0">
++                                <TextBlock Text="CLIPPING" Foreground="Red" FontWeight="Bold" DockPanel.Dock="Right"
++                                           Visibility="{Binding ClipWarning, Converter={StaticResource BoolToVis}}"/>
++                                <TextBlock Text="{Binding LevelText}" FontFamily="Consolas"/>
++                            </DockPanel>
++                            <TextBlock Text="{Binding StatsText}" FontFamily="Consolas" FontSize="11" Foreground="#444" Margin="0,3,0,0"
++                                       TextWrapping="Wrap"/>
++                        </StackPanel>
++                    </Border>
++
++                    <TextBlock Grid.Row="2" Text="{Binding StatusText}" FontWeight="SemiBold" Margin="0,0,0,6" TextWrapping="Wrap"/>
++
++                    <!-- Результаты -->
++                    <TextBox Grid.Row="3" Text="{Binding ResultText, Mode=OneWay}" IsReadOnly="True" FontFamily="Consolas" FontSize="12"
++                             TextWrapping="NoWrap" AcceptsReturn="True" VerticalScrollBarVisibility="Auto"
++                             HorizontalScrollBarVisibility="Auto" MinHeight="140" Background="White"/>
++                </Grid>
++            </TabItem>
++        </TabControl>
++
++        <TextBlock Grid.Row="1" Margin="2,8,2,0" Style="{StaticResource Hint}"
++                   Text="Changes are saved automatically. The test tab records only audio and does not start the screen recorder."/>
++    </Grid>
++</Window>
+diff --git a/src/ScreenRecorder.App/Views/AudioSettingsWindow.xaml.cs b/src/ScreenRecorder.App/Views/AudioSettingsWindow.xaml.cs
+new file mode 100644
+index 0000000..5c604d8
+--- /dev/null
++++ b/src/ScreenRecorder.App/Views/AudioSettingsWindow.xaml.cs
+@@ -0,0 +1,23 @@
++using System.ComponentModel;
++using System.Windows;
++using ScreenRecorder.App.ViewModels;
++
++namespace ScreenRecorder.App.Views;
++
++public partial class AudioSettingsWindow : Window
++{
++    private readonly AudioSettingsViewModel _vm;
++
++    public AudioSettingsWindow(AudioSettingsViewModel vm)
++    {
++        InitializeComponent();
++        _vm = vm;
++        DataContext = vm;
++    }
++
++    protected override void OnClosing(CancelEventArgs e)
++    {
++        _vm.Cleanup();
++        base.OnClosing(e);
++    }
++}
+diff --git a/src/ScreenRecorder.App/Views/RecordingsWindow.xaml b/src/ScreenRecorder.App/Views/RecordingsWindow.xaml
+index 2928b0d..8d20df1 100644
+--- a/src/ScreenRecorder.App/Views/RecordingsWindow.xaml
++++ b/src/ScreenRecorder.App/Views/RecordingsWindow.xaml
+@@ -4,16 +4,33 @@
+         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+         mc:Ignorable="d"
+-        Title="Saved Recordings" Height="400" Width="600" Background="#F0F0F0">
++        Title="Saved Recordings" Height="540" Width="640" Background="#F0F0F0">
+     <Grid Margin="10">
+         <Grid.RowDefinitions>
++            <RowDefinition Height="Auto"/>
+             <RowDefinition Height="Auto"/>
+             <RowDefinition Height="*"/>
+         </Grid.RowDefinitions>
++
++        <!-- Папка для записей по умолчанию -->
++        <Border Grid.Row="0" Background="White" BorderBrush="#DDD" BorderThickness="1" Padding="10" Margin="0,0,0,10">
++            <StackPanel>
++                <TextBlock Text="Default save folder" FontWeight="Bold" Margin="0,0,0,5"/>
++                <TextBox Text="{Binding OutputFolder, Mode=OneWay}" IsReadOnly="True" Background="#FAFAFA"
++                         Padding="4,3" ToolTip="{Binding OutputFolder}"/>
++                <StackPanel Orientation="Horizontal" Margin="0,8,0,0">
++                    <Button Content="Change..." Command="{Binding ChooseOutputFolderCommand}" Padding="12,4" Margin="0,0,8,0"/>
++                    <Button Content="Open folder" Command="{Binding OpenOutputFolderCommand}" Padding="12,4" Margin="0,0,8,0"/>
++                    <Button Content="Reset to default" Command="{Binding ResetOutputFolderCommand}" Padding="12,4"/>
++                </StackPanel>
++                <TextBlock Text="New recordings are saved here. Audio test files go to the AudioTests subfolder."
++                           Foreground="#666" FontSize="11" Margin="0,6,0,0" TextWrapping="Wrap"/>
++            </StackPanel>
++        </Border>
++
++        <Button Grid.Row="1" Content="Refresh List" Command="{Binding RefreshFilesCommand}" HorizontalAlignment="Right" Padding="10,5" Margin="0,0,0,10"/>
+         
+-        <Button Content="Refresh List" Command="{Binding RefreshFilesCommand}" HorizontalAlignment="Right" Padding="10,5" Margin="0,0,0,10"/>
+-        
+-        <ListBox Grid.Row="1" ItemsSource="{Binding SavedFiles}">
++        <ListBox Grid.Row="2" ItemsSource="{Binding SavedFiles}">
+             <ListBox.ItemTemplate>
+                 <DataTemplate>
+                     <Border BorderBrush="LightGray" BorderThickness="0,0,0,1" Padding="5">
+diff --git a/src/ScreenRecorder.Core/Interfaces/Interfaces.cs b/src/ScreenRecorder.Core/Interfaces/Interfaces.cs
+index 170fca4..2e101d7 100644
+--- a/src/ScreenRecorder.Core/Interfaces/Interfaces.cs
++++ b/src/ScreenRecorder.Core/Interfaces/Interfaces.cs
+@@ -20,10 +20,37 @@ public interface IVideoCapture {
+ }
+ 
+ public interface IAudioCapture {
+-    Task StartAsync(string deviceId, string outputPath, CancellationToken ct);
++    bool IsRunning { get; }
++    string? LastError { get; }
++    AudioCaptureReport? LastReport { get; }
++    /// <summary>Уровень сигнала (после обработки), примерно 10 раз в секунду. Вызывается из фонового потока.</summary>
++    event Action<AudioLevel>? LevelMeasured;
++    AudioCaptureStats? GetStats();
++    Task StartAsync(AudioCaptureRequest request, CancellationToken ct);
+     Task StopAsync();
+ }
+ 
++public interface IAudioDeviceService {
++    IReadOnlyList<AudioDevice> GetDevices();
++    /// <summary>Короткое описание формата устройства, например "48000 Hz, 32-bit float, 2 ch".</summary>
++    string DescribeMixFormat(string deviceId);
++    /// <summary>Перебирает типовые форматы и сообщает, какие драйвер принимает в shared/exclusive режиме.</summary>
++    Task<string> ProbeFormatsAsync(string deviceId);
++}
++
++public interface IAudioTestService {
++    bool IsRunning { get; }
++    event Action<AudioLevel>? Level;
++    AudioCaptureStats? GetLiveStats();
++    /// <summary>Запускает запись звука без видео. Возвращает текст ошибки или null при успехе.</summary>
++    Task<string?> StartAsync(AudioTestOptions options);
++    Task<AudioTestResult> StopAsync();
++    /// <summary>Прогоняет ранее записанный raw-файл через текущую цепочку обработки.</summary>
++    Task<AudioTestResult> ReprocessAsync(string rawWavPath, AudioCaptureSettings settings, AudioTestContainer container);
++    /// <summary>Анализирует любой аудио/видеофайл (не-WAV предварительно конвертируется через ffmpeg).</summary>
++    Task<AudioAnalysis> AnalyzeFileAsync(string path);
++}
++
+ public interface IRecordingSession {
+     RecordingState State { get; }
+     TimeSpan Elapsed { get; }
+diff --git a/src/ScreenRecorder.Core/Models/AudioModels.cs b/src/ScreenRecorder.Core/Models/AudioModels.cs
+new file mode 100644
+index 0000000..986c6c1
+--- /dev/null
++++ b/src/ScreenRecorder.Core/Models/AudioModels.cs
+@@ -0,0 +1,255 @@
++using System;
++using System.Collections.Generic;
++using System.Globalization;
++using System.Linq;
++using System.Text;
++
++namespace ScreenRecorder.Core.Models;
++
++/// <summary>Способ захвата звука с устройства.</summary>
++public enum AudioCaptureApi
++{
++    /// <summary>WASAPI shared, по событию драйвера (рекомендуется).</summary>
++    WasapiEvent,
++    /// <summary>WASAPI shared, опрос по таймеру. Иногда стабильнее на виртуальных драйверах (iVCam).</summary>
++    WasapiPolling,
++    /// <summary>WASAPI exclusive. Минимум преобразований, но устройство должно поддерживать формат.</summary>
++    WasapiExclusive
++}
++
++public enum AudioBitDepth { Pcm16, Pcm24, Float32 }
++
++public enum AudioChannelMode { Auto, Mono, Stereo, LeftOnly, RightOnly }
++
++public enum AudioTestContainer { Wav, Flac, Mp3, M4a }
++
++/// <summary>Десятиполосный эквалайзер. Полосы фиксированы, меняется только усиление.</summary>
++public sealed class EqualizerSettings
++{
++    public bool Enabled { get; set; }
++    public string Preset { get; set; } = "Flat";
++    public float[] BandGainsDb { get; set; } = new float[EqualizerPresets.BandCount];
++
++    public EqualizerSettings Clone() => new()
++    {
++        Enabled = Enabled,
++        Preset = Preset,
++        BandGainsDb = (float[])BandGainsDb.Clone()
++    };
++
++    public void Normalize()
++    {
++        var fixedBands = new float[EqualizerPresets.BandCount];
++        if (BandGainsDb != null)
++            for (int i = 0; i < Math.Min(BandGainsDb.Length, fixedBands.Length); i++)
++                fixedBands[i] = Math.Clamp(float.IsFinite(BandGainsDb[i]) ? BandGainsDb[i] : 0f, -12f, 12f);
++        BandGainsDb = fixedBands;
++        if (string.IsNullOrWhiteSpace(Preset)) Preset = "Flat";
++    }
++}
++
++public static class EqualizerPresets
++{
++    public const int BandCount = 10;
++    public const string Custom = "Custom";
++
++    public static readonly float[] BandFrequencies = { 31.5f, 63f, 125f, 250f, 500f, 1000f, 2000f, 4000f, 8000f, 16000f };
++    public static readonly string[] BandLabels = { "31", "63", "125", "250", "500", "1k", "2k", "4k", "8k", "16k" };
++
++    public static readonly IReadOnlyDictionary<string, float[]> All = new Dictionary<string, float[]>
++    {
++        ["Flat"]                 = new float[] {  0,  0,  0,  0,  0,  0,  0,  0,  0,  0 },
++        ["Voice clarity"]        = new float[] { -8, -6, -3,  0,  0,  1,  3,  4,  2,  0 },
++        ["Reduce rumble"]        = new float[] { -12, -9, -5, -2,  0,  0,  0,  0,  0,  0 },
++        ["Reduce hiss"]          = new float[] {  0,  0,  0,  0,  0,  0, -1, -3, -6, -9 },
++        ["Warm"]                 = new float[] {  2,  3,  3,  2,  1,  0, -1, -2, -2, -3 },
++        ["Bright"]               = new float[] {  0,  0,  0,  0,  0,  1,  2,  3,  5,  6 },
++    };
++
++    /// <summary>Имена пресетов в порядке показа (Custom последним).</summary>
++    public static IReadOnlyList<string> Names { get; } = All.Keys.Append(Custom).ToList();
++}
++
++/// <summary>
++/// Все настройки захвата и обработки звука, влияющие на качество записи.
++/// Сериализуется в settings.json. Перед использованием вызывать Normalize().
++/// </summary>
++public sealed class AudioCaptureSettings
++{
++    // --- Захват ---
++    public AudioCaptureApi Api { get; set; } = AudioCaptureApi.WasapiEvent;
++    public int BufferMs { get; set; } = 100;
++    /// <summary>false = формат берётся из драйвера (mix format). true = запросить формат ниже.</summary>
++    public bool RequestCustomDriverFormat { get; set; }
++    public int DriverSampleRate { get; set; } = 48000;
++    public AudioBitDepth DriverBitDepth { get; set; } = AudioBitDepth.Pcm16;
++    public int DriverChannels { get; set; } = 2;
++    public bool BoostThreadPriority { get; set; } = true;
++    public bool LowerEncoderPriority { get; set; } = true;
++
++    // --- Обработка и выходной формат ---
++    /// <summary>0 = как у источника.</summary>
++    public int OutputSampleRate { get; set; }
++    public AudioBitDepth OutputBitDepth { get; set; } = AudioBitDepth.Pcm16;
++    public AudioChannelMode ChannelMode { get; set; } = AudioChannelMode.Auto;
++    public float InputGainDb { get; set; }
++    /// <summary>0 = выключен.</summary>
++    public int HighPassHz { get; set; }
++    public bool Dither { get; set; } = true;
++    public EqualizerSettings Equalizer { get; set; } = new();
++
++    // --- Итоговая AAC-дорожка в MP4 ---
++    public int AacBitrateKbps { get; set; } = 192;
++
++    public static readonly int[] AllowedDriverRates = { 8000, 16000, 22050, 32000, 44100, 48000, 88200, 96000 };
++
++    public AudioCaptureSettings Clone() => new()
++    {
++        Api = Api, BufferMs = BufferMs,
++        RequestCustomDriverFormat = RequestCustomDriverFormat,
++        DriverSampleRate = DriverSampleRate, DriverBitDepth = DriverBitDepth, DriverChannels = DriverChannels,
++        BoostThreadPriority = BoostThreadPriority, LowerEncoderPriority = LowerEncoderPriority,
++        OutputSampleRate = OutputSampleRate, OutputBitDepth = OutputBitDepth, ChannelMode = ChannelMode,
++        InputGainDb = InputGainDb, HighPassHz = HighPassHz, Dither = Dither,
++        Equalizer = (Equalizer ?? new EqualizerSettings()).Clone(),
++        AacBitrateKbps = AacBitrateKbps
++    };
++
++    /// <summary>Приводит значения к допустимым (на случай повреждённого JSON).</summary>
++    public void Normalize()
++    {
++        BufferMs = Math.Clamp(BufferMs, 10, 1000);
++        DriverSampleRate = AllowedDriverRates.OrderBy(r => Math.Abs(r - DriverSampleRate)).First();
++        DriverChannels = Math.Clamp(DriverChannels, 1, 2);
++        OutputSampleRate = OutputSampleRate <= 0 ? 0 : Math.Clamp(OutputSampleRate, 8000, 192000);
++        InputGainDb = float.IsFinite(InputGainDb) ? Math.Clamp(InputGainDb, -30f, 30f) : 0f;
++        HighPassHz = HighPassHz <= 0 ? 0 : Math.Clamp(HighPassHz, 20, 500);
++        AacBitrateKbps = Math.Clamp(AacBitrateKbps, 64, 512);
++        Equalizer ??= new EqualizerSettings();
++        Equalizer.Normalize();
++    }
++
++    public string Describe()
++    {
++        var sb = new StringBuilder();
++        sb.Append(CultureInfo.InvariantCulture, $"api={Api}, buffer={BufferMs}ms");
++        sb.Append(RequestCustomDriverFormat
++            ? $", driver={DriverSampleRate}Hz/{DriverBitDepth}/{DriverChannels}ch"
++            : ", driver=mix format");
++        sb.Append($", out={(OutputSampleRate == 0 ? "src" : OutputSampleRate + "Hz")}/{OutputBitDepth}/{ChannelMode}");
++        sb.Append(CultureInfo.InvariantCulture, $", gain={InputGainDb:0.#}dB, hp={(HighPassHz == 0 ? "off" : HighPassHz + "Hz")}");
++        sb.Append($", eq={(Equalizer.Enabled ? Equalizer.Preset : "off")}, dither={Dither}, boost={BoostThreadPriority}, aac={AacBitrateKbps}k");
++        return sb.ToString();
++    }
++}
++
++/// <summary>Запрос на запись звука в WAV.</summary>
++public sealed record AudioCaptureRequest(
++    string DeviceId,
++    string OutputPath,
++    AudioCaptureSettings Settings,
++    string? RawCopyPath = null);
++
++/// <summary>Уровень сигнала за последний интервал. Значения в dBFS.</summary>
++public readonly record struct AudioLevel(float PeakDb, float RmsDb, int Clipped);
++
++public sealed record AudioCaptureStats(
++    long Packets,
++    double MaxGapMs,
++    double AvgGapMs,
++    int LateCallbacks,
++    int QueueDepth,
++    int MaxQueueDepth,
++    double ElapsedSec);
++
++public sealed record AudioCaptureReport(
++    string DeviceName,
++    string ApiUsed,
++    string DriverFormat,
++    string OutputFormat,
++    long Packets,
++    double MaxGapMs,
++    double AvgGapMs,
++    int LateCallbacks,
++    double PaddedMs,
++    double DurationSec,
++    int MaxQueueDepth,
++    bool ThreadBoosted,
++    string? Notes)
++{
++    public string ToText()
++    {
++        var sb = new StringBuilder();
++        sb.AppendLine($"Device:        {DeviceName}");
++        sb.AppendLine($"API:           {ApiUsed}");
++        sb.AppendLine($"Driver format: {DriverFormat}");
++        sb.AppendLine($"Output format: {OutputFormat}");
++        sb.AppendLine(string.Create(CultureInfo.InvariantCulture,
++            $"Duration:      {DurationSec:F2} s, packets: {Packets}"));
++        sb.AppendLine(string.Create(CultureInfo.InvariantCulture,
++            $"Packet gap:    avg {AvgGapMs:F1} ms, max {MaxGapMs:F0} ms, late callbacks: {LateCallbacks}"));
++        sb.AppendLine(string.Create(CultureInfo.InvariantCulture,
++            $"Silence added: {PaddedMs:F0} ms, max queue: {MaxQueueDepth}, thread boosted: {(ThreadBoosted ? "yes" : "no")}"));
++        if (!string.IsNullOrWhiteSpace(Notes)) sb.AppendLine($"Notes:         {Notes}");
++        return sb.ToString();
++    }
++}
++
++/// <summary>Результат анализа готового аудиофайла на щелчки, провалы и клиппинг (эвристика).</summary>
++public sealed record AudioAnalysis(
++    string FileName,
++    double DurationSec,
++    int SampleRate,
++    double PeakDb,
++    double RmsDb,
++    double NoiseFloorDb,
++    long ClippedSamples,
++    double DcOffset,
++    int Dropouts,
++    int Clicks,
++    double ClicksPerMinute,
++    string Verdict)
++{
++    public string ToText()
++    {
++        var c = CultureInfo.InvariantCulture;
++        var sb = new StringBuilder();
++        sb.AppendLine($"File: {FileName}");
++        sb.AppendLine(string.Create(c, $"  Length {DurationSec:F2} s, {SampleRate} Hz (analysed as mono)"));
++        sb.AppendLine(string.Create(c, $"  Peak {PeakDb:F1} dBFS, RMS {RmsDb:F1} dBFS, noise floor {NoiseFloorDb:F1} dBFS, DC {DcOffset:F4}"));
++        sb.AppendLine(string.Create(c, $"  Clipped samples: {ClippedSamples}, digital-silence dropouts: {Dropouts}"));
++        sb.AppendLine(string.Create(c, $"  Suspected clicks: {Clicks} ({ClicksPerMinute:F1} per minute)"));
++        sb.AppendLine($"  Verdict: {Verdict}");
++        return sb.ToString();
++    }
++}
++
++public sealed record AudioTestOptions(
++    string DeviceId,
++    string OutputFolder,
++    AudioCaptureSettings Settings,
++    bool SaveRawCopy,
++    AudioTestContainer Container);
++
++public sealed record AudioTestResult(
++    string? ProcessedPath,
++    string? RawPath,
++    string? ConvertedPath,
++    AudioCaptureReport? Report,
++    AudioAnalysis? Processed,
++    AudioAnalysis? Raw,
++    string? Error)
++{
++    public string ToText()
++    {
++        var sb = new StringBuilder();
++        if (Error != null) sb.AppendLine($"ERROR: {Error}").AppendLine();
++        if (Report != null) sb.AppendLine(Report.ToText());
++        if (ProcessedPath != null) sb.AppendLine($"Processed: {ProcessedPath}");
++        if (RawPath != null) sb.AppendLine($"Raw (unprocessed): {RawPath}");
++        if (ConvertedPath != null) sb.AppendLine($"Converted: {ConvertedPath}");
++        if (Processed != null) { sb.AppendLine(); sb.AppendLine("--- Processed ---"); sb.Append(Processed.ToText()); }
++        if (Raw != null) { sb.AppendLine(); sb.AppendLine("--- Raw ---"); sb.Append(Raw.ToText()); }
++        return sb.ToString();
++    }
++}
+diff --git a/src/ScreenRecorder.Core/Models/Models.cs b/src/ScreenRecorder.Core/Models/Models.cs
+index bbf9cc9..6e58399 100644
+--- a/src/ScreenRecorder.Core/Models/Models.cs
++++ b/src/ScreenRecorder.Core/Models/Models.cs
+@@ -26,4 +26,5 @@ public sealed record RecordingOptions(
+     string LogoText = "RECORDER",
+     float LogoOpacity = 0.5f,
+     float LogoScale = 1.0f,
+-    LogoPosition LogoPosition = LogoPosition.TopRight);
++    LogoPosition LogoPosition = LogoPosition.TopRight,
++    AudioCaptureSettings? AudioSettings = null);
+diff --git a/src/ScreenRecorder.Infrastructure/Audio/AudioAnalyzer.cs b/src/ScreenRecorder.Infrastructure/Audio/AudioAnalyzer.cs
+new file mode 100644
+index 0000000..d43b25d
+--- /dev/null
++++ b/src/ScreenRecorder.Infrastructure/Audio/AudioAnalyzer.cs
+@@ -0,0 +1,166 @@
++using System;
++using System.Collections.Generic;
++using System.IO;
++using System.Linq;
++using System.Threading.Tasks;
++using NAudio.Wave;
++using ScreenRecorder.Core.Models;
++using ScreenRecorder.Infrastructure.Encoding;
++
++namespace ScreenRecorder.Infrastructure.Audio;
++
++/// <summary>
++/// Простой анализатор WAV: ищет клиппинг, «цифровую тишину» посреди записи (потерянные пакеты)
++/// и резкие скачки сигнала (щелчки). Это эвристика: она хорошо подходит для сравнения двух записей
++/// одного и того же источника (например, ScreenRecorder и Bandicam), но не заменяет прослушивание.
++/// Пороги вынесены в константы.
++/// </summary>
++public static class AudioAnalyzer
++{
++    private const float ClickAbsoluteMin = 0.03f;   // минимальный скачок между соседними сэмплами
++    private const float ClickRelativeFactor = 12f;  // во сколько раз скачок выше локального среднего
++    private const double ClickRefractoryMs = 2.0;   // не считаем один щелчок несколько раз
++    private const double DropoutMinMs = 2.0;        // минимальная длина «цифровой тишины»
++
++    public static AudioAnalysis AnalyzeWav(string path, string? displayName = null)
++    {
++        using var reader = new WaveFileReader(path);
++        var fmt = reader.WaveFormat;
++        int ch = fmt.Channels;
++        int rate = fmt.SampleRate;
++        int frameBytes = fmt.BlockAlign;
++
++        const int framesPerRead = 8192;
++        var bytes = new byte[frameBytes * framesPerRead];
++        var dec = new float[framesPerRead * ch];
++
++        long total = 0, clipped = 0;
++        double sumSq = 0, sum = 0;
++        float peak = 0;
++
++        int winLen = Math.Max(1, rate / 50); // окно 20 мс
++        double winSq = 0; int winCnt = 0;
++        var windowsDb = new List<float>();
++
++        float prev = 0, ema = 0;
++        float alpha = 1f / Math.Max(1f, 0.005f * rate);
++        long lastClick = -1_000_000;
++        long refractory = (long)(ClickRefractoryMs * rate / 1000.0);
++        long warmup = rate / 50;
++        int clicks = 0;
++
++        long zeroRun = 0, minZeroRun = (long)(DropoutMinMs * rate / 1000.0);
++        bool seenSignal = false;
++        int dropouts = 0;
++
++        int n;
++        while ((n = reader.Read(bytes, 0, bytes.Length)) > 0)
++        {
++            int frames = n / frameBytes;
++            if (frames == 0) break;
++            AudioFormatHelper.Decode(bytes, frames * ch, fmt, dec);
++
++            for (int f = 0; f < frames; f++)
++            {
++                float x;
++                if (ch == 1) x = dec[f];
++                else
++                {
++                    float s = 0;
++                    for (int c = 0; c < ch; c++) s += dec[f * ch + c];
++                    x = s / ch;
++                }
++
++                float a = Math.Abs(x);
++                if (a > peak) peak = a;
++                if (a >= 0.999f) clipped++;
++                sumSq += (double)x * x;
++                sum += x;
++
++                winSq += (double)x * x;
++                if (++winCnt >= winLen)
++                {
++                    windowsDb.Add((float)(10.0 * Math.Log10(Math.Max(winSq / winCnt, 1e-12))));
++                    winSq = 0; winCnt = 0;
++                }
++
++                // Цифровая тишина посреди записи (не в начале и не в конце).
++                if (a < 1e-9f) zeroRun++;
++                else
++                {
++                    if (seenSignal && zeroRun >= minZeroRun) dropouts++;
++                    zeroRun = 0;
++                    seenSignal = true;
++                }
++
++                // Щелчки: скачок между соседними сэмплами сильно выше среднего скачка за последние ~5 мс.
++                float d = Math.Abs(x - prev);
++                if (total > warmup && d > Math.Max(ClickAbsoluteMin, ClickRelativeFactor * ema)
++                    && total - lastClick > refractory)
++                {
++                    clicks++;
++                    lastClick = total;
++                }
++                ema += alpha * (d - ema);
++                prev = x;
++                total++;
++            }
++        }
++
++        double duration = rate > 0 ? total / (double)rate : 0;
++        double rms = total > 0 ? Math.Sqrt(sumSq / total) : 0;
++        double dc = total > 0 ? sum / total : 0;
++        double noiseFloor = -120;
++        if (windowsDb.Count > 0)
++        {
++            windowsDb.Sort();
++            noiseFloor = windowsDb[(int)(windowsDb.Count * 0.10)];
++        }
++        double perMin = duration > 1 ? clicks / (duration / 60.0) : 0;
++
++        string verdict;
++        if (total == 0) verdict = "File is empty.";
++        else if (dropouts > 0 || perMin > 15)
++            verdict = "Likely audible defects (dropouts or crackle). Compare with a known-good recording of the same source.";
++        else if (perMin > 3)
++            verdict = "Some suspicious clicks. Compare with a known-good recording of the same source.";
++        else
++            verdict = "No obvious defects detected by this heuristic.";
++        if (total > 0 && clipped > total * 0.0001) verdict += " Signal clips: lower the input gain.";
++
++        return new AudioAnalysis(displayName ?? Path.GetFileName(path), duration, rate,
++            peak > 1e-6f ? 20.0 * Math.Log10(peak) : -120, rms > 1e-6 ? 20.0 * Math.Log10(rms) : -120,
++            noiseFloor, clipped, dc, dropouts, clicks, perMin, verdict);
++    }
++
++    /// <summary>Анализирует WAV напрямую, остальные форматы (mp4, m4a, mp3, flac…) сначала конвертирует через ffmpeg.</summary>
++    public static async Task<AudioAnalysis> AnalyzeAnyAsync(string path)
++    {
++        if (string.Equals(Path.GetExtension(path), ".wav", StringComparison.OrdinalIgnoreCase))
++        {
++            return await Task.Run(() => AnalyzeWav(path));
++        }
++
++        string tmp = Path.Combine(Path.GetTempPath(), "sr_analyze_" + Guid.NewGuid().ToString("N") + ".wav");
++        try
++        {
++            var (code, err) = await FfmpegRunner.RunAsync(new[]
++            {
++                "-y", "-i", path, "-vn", "-ac", "1", "-ar", "48000", "-c:a", "pcm_s16le", tmp
++            });
++            if (code != 0 || !File.Exists(tmp))
++                throw new InvalidOperationException("ffmpeg could not read the audio: " + Tail(err));
++            return await Task.Run(() => AnalyzeWav(tmp, Path.GetFileName(path)));
++        }
++        finally
++        {
++            try { if (File.Exists(tmp)) File.Delete(tmp); } catch { }
++        }
++    }
++
++    private static string Tail(string s)
++    {
++        var lines = s.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
++        return string.Join(" | ", lines.TakeLast(2));
++    }
++}
+diff --git a/src/ScreenRecorder.Infrastructure/Audio/AudioDeviceService.cs b/src/ScreenRecorder.Infrastructure/Audio/AudioDeviceService.cs
+new file mode 100644
+index 0000000..0500e19
+--- /dev/null
++++ b/src/ScreenRecorder.Infrastructure/Audio/AudioDeviceService.cs
+@@ -0,0 +1,88 @@
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Text;
++using System.Threading.Tasks;
++using NAudio.CoreAudioApi;
++using NAudio.Wave;
++using ScreenRecorder.Core.Interfaces;
++using ScreenRecorder.Core.Models;
++
++namespace ScreenRecorder.Infrastructure.Audio;
++
++public sealed class AudioDeviceService : IAudioDeviceService
++{
++    public IReadOnlyList<AudioDevice> GetDevices()
++    {
++        var list = new List<AudioDevice>();
++        try
++        {
++            using var en = new MMDeviceEnumerator();
++            foreach (var d in en.EnumerateAudioEndPoints(DataFlow.Capture, DeviceState.Active))
++                list.Add(new AudioDevice(d.ID, d.FriendlyName, true));
++            foreach (var d in en.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
++                list.Add(new AudioDevice(d.ID, d.FriendlyName, false));
++        }
++        catch { /* нет устройств или сервис звука недоступен */ }
++        return list;
++    }
++
++    public string DescribeMixFormat(string deviceId)
++    {
++        try
++        {
++            using var en = new MMDeviceEnumerator();
++            var dev = en.GetDevice(deviceId);
++            return AudioFormatHelper.Describe(dev.AudioClient.MixFormat) + " (shared-mode mix format)";
++        }
++        catch (Exception ex)
++        {
++            return "unavailable: " + ex.Message;
++        }
++    }
++
++    public Task<string> ProbeFormatsAsync(string deviceId) => Task.Run(() =>
++    {
++        var sb = new StringBuilder();
++        try
++        {
++            using var en = new MMDeviceEnumerator();
++            var dev = en.GetDevice(deviceId);
++            var ac = dev.AudioClient;
++            sb.AppendLine($"Device: {dev.FriendlyName} ({(dev.DataFlow == DataFlow.Capture ? "input" : "output, loopback")})");
++            sb.AppendLine($"Mix format: {AudioFormatHelper.Describe(ac.MixFormat)}");
++
++            foreach (var mode in new[] { AudioClientShareMode.Shared, AudioClientShareMode.Exclusive })
++            {
++                sb.AppendLine();
++                sb.AppendLine($"{mode} mode, formats accepted by the driver:");
++                bool any = false;
++                foreach (int rate in AudioCaptureSettings.AllowedDriverRates)
++                {
++                    var ok = new List<string>();
++                    foreach (int ch in new[] { 1, 2 })
++                    {
++                        if (Supported(ac, mode, new WaveFormat(rate, 16, ch))) ok.Add($"16-bit/{ch}ch");
++                        if (Supported(ac, mode, new WaveFormat(rate, 24, ch))) ok.Add($"24-bit/{ch}ch");
++                        if (Supported(ac, mode, WaveFormat.CreateIeeeFloatWaveFormat(rate, ch))) ok.Add($"float/{ch}ch");
++                    }
++                    if (ok.Count > 0) { any = true; sb.AppendLine($"  {rate} Hz: {string.Join(", ", ok)}"); }
++                }
++                if (!any) sb.AppendLine("  none of the tested formats");
++            }
++            sb.AppendLine();
++            sb.AppendLine("Note: in shared mode Windows can convert formats itself, so the list may be short while a custom format still works.");
++        }
++        catch (Exception ex)
++        {
++            sb.AppendLine("Probe failed: " + ex.Message);
++        }
++        return sb.ToString();
++    });
++
++    private static bool Supported(AudioClient ac, AudioClientShareMode mode, WaveFormat fmt)
++    {
++        try { return ac.IsFormatSupported(mode, fmt); }
++        catch { return false; }
++    }
++}
+diff --git a/src/ScreenRecorder.Infrastructure/Audio/AudioFormatHelper.cs b/src/ScreenRecorder.Infrastructure/Audio/AudioFormatHelper.cs
+new file mode 100644
+index 0000000..e064efd
+--- /dev/null
++++ b/src/ScreenRecorder.Infrastructure/Audio/AudioFormatHelper.cs
+@@ -0,0 +1,62 @@
++using System;
++using NAudio.Wave;
++
++namespace ScreenRecorder.Infrastructure.Audio;
++
++/// <summary>Вспомогательные функции для работы с форматами и декодирования PCM/float в float[].</summary>
++public static class AudioFormatHelper
++{
++    private static readonly Guid SubtypeIeeeFloat = new("00000003-0000-0010-8000-00aa00389b71");
++
++    public static bool IsFloat(WaveFormat f) =>
++        f.Encoding == WaveFormatEncoding.IeeeFloat ||
++        (f is WaveFormatExtensible ext && ext.SubFormat == SubtypeIeeeFloat);
++
++    /// <summary>Заголовок WAV без WAVE_FORMAT_EXTENSIBLE (его понимают все плееры и NAudio-ридеры).</summary>
++    public static WaveFormat ToStandard(WaveFormat f) =>
++        IsFloat(f)
++            ? WaveFormat.CreateIeeeFloatWaveFormat(f.SampleRate, f.Channels)
++            : new WaveFormat(f.SampleRate, f.BitsPerSample, f.Channels);
++
++    public static string Describe(WaveFormat f) =>
++        $"{f.SampleRate} Hz, {f.BitsPerSample}-bit {(IsFloat(f) ? "float" : "PCM")}, {f.Channels} ch";
++
++    /// <summary>
++    /// Преобразует байты в float [-1..1]. Выходной массив должен вмещать count сэмплов
++    /// (count = число сэмплов всех каналов).
++    /// </summary>
++    public static void Decode(byte[] src, int sampleCount, WaveFormat f, float[] dst)
++    {
++        bool isFloat = IsFloat(f);
++        int bits = f.BitsPerSample;
++        if (isFloat)
++        {
++            if (bits == 32) { for (int i = 0; i < sampleCount; i++) dst[i] = BitConverter.ToSingle(src, i * 4); }
++            else if (bits == 64) { for (int i = 0; i < sampleCount; i++) dst[i] = (float)BitConverter.ToDouble(src, i * 8); }
++            else throw new NotSupportedException($"Unsupported float bit depth: {bits}");
++            return;
++        }
++        switch (bits)
++        {
++            case 8:
++                for (int i = 0; i < sampleCount; i++) dst[i] = (src[i] - 128) / 128f;
++                break;
++            case 16:
++                for (int i = 0; i < sampleCount; i++) dst[i] = BitConverter.ToInt16(src, i * 2) / 32768f;
++                break;
++            case 24:
++                for (int i = 0; i < sampleCount; i++)
++                {
++                    int o = i * 3;
++                    int v = src[o] | (src[o + 1] << 8) | ((sbyte)src[o + 2] << 16);
++                    dst[i] = v / 8388608f;
++                }
++                break;
++            case 32:
++                for (int i = 0; i < sampleCount; i++) dst[i] = BitConverter.ToInt32(src, i * 4) / 2147483648f;
++                break;
++            default:
++                throw new NotSupportedException($"Unsupported PCM bit depth: {bits}");
++        }
++    }
++}
+diff --git a/src/ScreenRecorder.Infrastructure/Audio/AudioProcessingChain.cs b/src/ScreenRecorder.Infrastructure/Audio/AudioProcessingChain.cs
+new file mode 100644
+index 0000000..6890167
+--- /dev/null
++++ b/src/ScreenRecorder.Infrastructure/Audio/AudioProcessingChain.cs
+@@ -0,0 +1,244 @@
++using System;
++using System.Collections.Generic;
++using NAudio.Dsp;
++using NAudio.Wave;
++using ScreenRecorder.Core.Models;
++
++namespace ScreenRecorder.Infrastructure.Audio;
++
++/// <summary>
++/// Цепочка обработки: байты устройства → float → выбор каналов → усиление → фильтр НЧ → эквалайзер →
++/// ресемплинг → квантование (16/24 бит PCM или 32 бит float) → приёмник. Не зависит от WASAPI,
++/// поэтому используется и при записи, и при повторной обработке готового raw-файла.
++/// Класс не потокобезопасен: вызывать из одного потока.
++/// </summary>
++public sealed class AudioProcessingChain
++{
++    private readonly WaveFormat _src;
++    private readonly AudioCaptureSettings _s;
++    private readonly int _srcCh, _outCh, _srcRate, _outRate, _blockAlign;
++    private readonly float _gain;
++    private readonly BiQuadFilter[][] _filters;
++    private readonly StreamingResampler? _resampler;
++    private readonly float[] _resBuf;
++
++    private float[] _decoded = Array.Empty<float>();
++    private float[] _mapped = Array.Empty<float>();
++    private byte[] _outBytes = Array.Empty<byte>();
++
++    private float _peak;
++    private double _sumSq;
++    private long _levelCount;
++    private int _clipped;
++
++    /// <summary>Формат, в котором эта цепочка отдаёт данные (стандартный WAV-заголовок).</summary>
++    public WaveFormat OutputFormat { get; }
++
++    public AudioProcessingChain(WaveFormat source, AudioCaptureSettings settings)
++    {
++        _src = source;
++        _s = settings;
++        _srcCh = source.Channels;
++        _srcRate = source.SampleRate;
++        _blockAlign = source.BlockAlign;
++
++        _outCh = settings.ChannelMode switch
++        {
++            AudioChannelMode.Mono or AudioChannelMode.LeftOnly or AudioChannelMode.RightOnly => 1,
++            AudioChannelMode.Stereo => 2,
++            _ => _srcCh == 1 ? 1 : 2
++        };
++        _outRate = settings.OutputSampleRate > 0 ? settings.OutputSampleRate : _srcRate;
++
++        OutputFormat = settings.OutputBitDepth switch
++        {
++            AudioBitDepth.Pcm16 => new WaveFormat(_outRate, 16, _outCh),
++            AudioBitDepth.Pcm24 => new WaveFormat(_outRate, 24, _outCh),
++            _ => WaveFormat.CreateIeeeFloatWaveFormat(_outRate, _outCh)
++        };
++
++        _gain = (float)Math.Pow(10.0, settings.InputGainDb / 20.0);
++
++        // Фильтры считаются на частоте источника: полосы выше 0.45*Fs не применяем (иначе нестабильны).
++        _filters = new BiQuadFilter[_outCh][];
++        for (int c = 0; c < _outCh; c++)
++        {
++            var list = new List<BiQuadFilter>();
++            if (settings.HighPassHz > 0 && settings.HighPassHz < _srcRate * 0.45f)
++                list.Add(BiQuadFilter.HighPassFilter(_srcRate, settings.HighPassHz, 0.7071f));
++            if (settings.Equalizer.Enabled)
++            {
++                for (int b = 0; b < EqualizerPresets.BandCount; b++)
++                {
++                    float gainDb = settings.Equalizer.BandGainsDb[b];
++                    float f = EqualizerPresets.BandFrequencies[b];
++                    if (Math.Abs(gainDb) >= 0.1f && f < _srcRate * 0.45f)
++                        list.Add(BiQuadFilter.PeakingEQ(_srcRate, f, 1.0f, gainDb));
++                }
++            }
++            _filters[c] = list.ToArray();
++        }
++
++        if (_outRate != _srcRate)
++            _resampler = new StreamingResampler(_srcRate, _outRate, _outCh);
++
++        _resBuf = new float[_outCh * 2048];
++        ValidateSource();
++    }
++
++    private void ValidateSource()
++    {
++        // Бросаем исключение заранее, а не посреди записи.
++        var probe = new byte[_blockAlign];
++        var dst = new float[_srcCh];
++        AudioFormatHelper.Decode(probe, _srcCh, _src, dst);
++    }
++
++    /// <summary>Обрабатывает порцию данных устройства и передаёт готовые байты приёмнику.</summary>
++    public void Process(byte[] src, int length, Action<byte[], int> sink)
++    {
++        int frames = length / _blockAlign;
++        if (frames <= 0) return;
++
++        int srcSamples = frames * _srcCh;
++        int outSamples = frames * _outCh;
++        Ensure(ref _decoded, srcSamples);
++        Ensure(ref _mapped, outSamples);
++
++        AudioFormatHelper.Decode(src, srcSamples, _src, _decoded);
++        MapChannels(frames);
++
++        for (int c = 0; c < _outCh; c++)
++        {
++            var chain = _filters[c];
++            for (int i = c; i < outSamples; i += _outCh)
++            {
++                float x = _mapped[i] * _gain;
++                for (int k = 0; k < chain.Length; k++) x = chain[k].Transform(x);
++                _mapped[i] = x;
++            }
++        }
++
++        if (_resampler == null)
++        {
++            Emit(_mapped, outSamples, sink);
++        }
++        else
++        {
++            _resampler.Push(_mapped, outSamples);
++            for (int guard = 0; guard < 4096; guard++)
++            {
++                int n = _resampler.Pull(_resBuf);
++                if (n <= 0) break;
++                Emit(_resBuf, n, sink);
++            }
++        }
++    }
++
++    /// <summary>Возвращает пик/RMS с прошлого вызова и сбрасывает счётчики.</summary>
++    public AudioLevel TakeLevel()
++    {
++        float peakDb = _peak > 1e-6f ? 20f * MathF.Log10(_peak) : -120f;
++        float rms = _levelCount > 0 ? (float)Math.Sqrt(_sumSq / _levelCount) : 0f;
++        float rmsDb = rms > 1e-6f ? 20f * MathF.Log10(rms) : -120f;
++        var level = new AudioLevel(peakDb, rmsDb, _clipped);
++        _peak = 0; _sumSq = 0; _levelCount = 0; _clipped = 0;
++        return level;
++    }
++
++    private void MapChannels(int frames)
++    {
++        int sc = _srcCh, oc = _outCh;
++        var d = _decoded;
++        var m = _mapped;
++        var mode = _s.ChannelMode;
++        for (int f = 0; f < frames; f++)
++        {
++            int si = f * sc, oi = f * oc;
++            switch (mode)
++            {
++                case AudioChannelMode.Mono:
++                {
++                    float sum = 0;
++                    for (int c = 0; c < sc; c++) sum += d[si + c];
++                    m[oi] = sum / sc;
++                    break;
++                }
++                case AudioChannelMode.LeftOnly:
++                    m[oi] = d[si];
++                    break;
++                case AudioChannelMode.RightOnly:
++                    m[oi] = d[si + (sc > 1 ? 1 : 0)];
++                    break;
++                default: // Auto, Stereo
++                    if (oc == 1) m[oi] = d[si];
++                    else { m[oi] = d[si]; m[oi + 1] = sc > 1 ? d[si + 1] : d[si]; }
++                    break;
++            }
++        }
++    }
++
++    private void Emit(float[] data, int count, Action<byte[], int> sink)
++    {
++        for (int i = 0; i < count; i++)
++        {
++            float x = data[i];
++            float a = Math.Abs(x);
++            if (a >= 1f) { _clipped++; x = x > 0 ? 1f : -1f; a = 1f; data[i] = x; }
++            if (a > _peak) _peak = a;
++            _sumSq += (double)x * x;
++        }
++        _levelCount += count;
++
++        switch (_s.OutputBitDepth)
++        {
++            case AudioBitDepth.Pcm16:
++            {
++                int bytes = count * 2;
++                Ensure(ref _outBytes, bytes);
++                int o = 0;
++                var rnd = Random.Shared;
++                for (int i = 0; i < count; i++)
++                {
++                    float v = data[i] * 32767f;
++                    if (_s.Dither) v += (float)(rnd.NextDouble() - rnd.NextDouble()); // TPDF, ±1 LSB
++                    int q = (int)MathF.Round(v);
++                    if (q > 32767) q = 32767; else if (q < -32768) q = -32768;
++                    _outBytes[o++] = (byte)q;
++                    _outBytes[o++] = (byte)(q >> 8);
++                }
++                sink(_outBytes, bytes);
++                break;
++            }
++            case AudioBitDepth.Pcm24:
++            {
++                int bytes = count * 3;
++                Ensure(ref _outBytes, bytes);
++                int o = 0;
++                for (int i = 0; i < count; i++)
++                {
++                    int q = (int)MathF.Round(data[i] * 8388607f);
++                    if (q > 8388607) q = 8388607; else if (q < -8388608) q = -8388608;
++                    _outBytes[o++] = (byte)q;
++                    _outBytes[o++] = (byte)(q >> 8);
++                    _outBytes[o++] = (byte)(q >> 16);
++                }
++                sink(_outBytes, bytes);
++                break;
++            }
++            default:
++            {
++                int bytes = count * 4;
++                Ensure(ref _outBytes, bytes);
++                Buffer.BlockCopy(data, 0, _outBytes, 0, bytes);
++                sink(_outBytes, bytes);
++                break;
++            }
++        }
++    }
++
++    private static void Ensure<T>(ref T[] arr, int size)
++    {
++        if (arr.Length < size) arr = new T[Math.Max(size, arr.Length * 2)];
++    }
++}
+diff --git a/src/ScreenRecorder.Infrastructure/Audio/AudioTestService.cs b/src/ScreenRecorder.Infrastructure/Audio/AudioTestService.cs
+new file mode 100644
+index 0000000..1fdb414
+--- /dev/null
++++ b/src/ScreenRecorder.Infrastructure/Audio/AudioTestService.cs
+@@ -0,0 +1,153 @@
++using System;
++using System.IO;
++using System.Linq;
++using System.Threading;
++using System.Threading.Tasks;
++using NAudio.Wave;
++using ScreenRecorder.Core.Enums;
++using ScreenRecorder.Core.Interfaces;
++using ScreenRecorder.Core.Models;
++using ScreenRecorder.Infrastructure.Encoding;
++
++namespace ScreenRecorder.Infrastructure.Audio;
++
++/// <summary>
++/// Запись только звука (без видео и без ffmpeg-видеоконвейера) для проверки чистоты захвата.
++/// Использует собственный экземпляр WasapiAudioCapture, поэтому не мешает основной записи,
++/// но запускается только когда основная запись не идёт.
++/// </summary>
++public sealed class AudioTestService : IAudioTestService
++{
++    private readonly ILoggerService _logger;
++    private readonly IRecordingSession _session;
++
++    private WasapiAudioCapture? _capture;
++    private AudioTestOptions? _options;
++    private string? _processedPath, _rawPath;
++
++    public AudioTestService(ILoggerService logger, IRecordingSession session)
++    {
++        _logger = logger;
++        _session = session;
++    }
++
++    public bool IsRunning => _capture?.IsRunning == true;
++    public event Action<AudioLevel>? Level;
++    public AudioCaptureStats? GetLiveStats() => _capture?.GetStats();
++
++    public async Task<string?> StartAsync(AudioTestOptions o)
++    {
++        if (IsRunning) return "A test is already running.";
++        if (_session.State != RecordingState.Idle) return "Stop the screen recording before running an audio test.";
++        if (string.IsNullOrWhiteSpace(o.DeviceId)) return "Select an audio device first.";
++
++        try { Directory.CreateDirectory(o.OutputFolder); }
++        catch (Exception ex) { return $"Cannot use test folder: {ex.Message}"; }
++
++        string stamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
++        _processedPath = Path.Combine(o.OutputFolder, $"audiotest_{stamp}.wav");
++        _rawPath = o.SaveRawCopy ? Path.Combine(o.OutputFolder, $"audiotest_{stamp}_raw.wav") : null;
++        _options = o;
++
++        var cap = new WasapiAudioCapture(_logger);
++        cap.LevelMeasured += l => Level?.Invoke(l);
++        _capture = cap;
++
++        await cap.StartAsync(new AudioCaptureRequest(o.DeviceId, _processedPath, o.Settings, _rawPath), CancellationToken.None);
++        if (!cap.IsRunning)
++        {
++            _capture = null;
++            return cap.LastError ?? "Audio capture failed to start (see log).";
++        }
++        _logger.Log($"Audio test started: {_processedPath}");
++        return null;
++    }
++
++    public async Task<AudioTestResult> StopAsync()
++    {
++        var cap = _capture;
++        var o = _options;
++        if (cap == null || o == null)
++            return new AudioTestResult(null, null, null, null, null, null, "No test is running.");
++
++        await cap.StopAsync();
++        _capture = null;
++        _logger.Log("Audio test stopped.");
++        return await FinishAsync(_processedPath, _rawPath, cap.LastReport, o.Container, o.Settings.AacBitrateKbps, cap.LastError);
++    }
++
++    public async Task<AudioTestResult> ReprocessAsync(string rawWavPath, AudioCaptureSettings settings, AudioTestContainer container)
++    {
++        var s = settings.Clone();
++        s.Normalize();
++        string dir = Path.GetDirectoryName(Path.GetFullPath(rawWavPath))!;
++        string baseName = Path.GetFileNameWithoutExtension(rawWavPath);
++        if (baseName.EndsWith("_raw", StringComparison.OrdinalIgnoreCase)) baseName = baseName[..^4];
++        string outPath = Path.Combine(dir, $"{baseName}_reprocessed_{DateTime.Now:HHmmss}.wav");
++
++        try
++        {
++            await Task.Run(() =>
++            {
++                using var reader = new WaveFileReader(rawWavPath);
++                var chain = new AudioProcessingChain(reader.WaveFormat, s);
++                using var writer = new WaveFileWriter(outPath, chain.OutputFormat);
++                var buf = new byte[reader.WaveFormat.BlockAlign * 4800];
++                int n;
++                while ((n = reader.Read(buf, 0, buf.Length)) > 0)
++                    chain.Process(buf, n, (b, c) => writer.Write(b, 0, c));
++            });
++            _logger.Log($"Audio test: reprocessed '{Path.GetFileName(rawWavPath)}' with [{s.Describe()}]");
++        }
++        catch (Exception ex)
++        {
++            _logger.Log($"Audio reprocess failed: {ex.Message}");
++            return new AudioTestResult(null, rawWavPath, null, null, null, null, $"Reprocess failed: {ex.Message}");
++        }
++        return await FinishAsync(outPath, null, null, container, s.AacBitrateKbps, null);
++    }
++
++    public Task<AudioAnalysis> AnalyzeFileAsync(string path) => AudioAnalyzer.AnalyzeAnyAsync(path);
++
++    private async Task<AudioTestResult> FinishAsync(string? processed, string? raw, AudioCaptureReport? report,
++        AudioTestContainer container, int aacKbps, string? error)
++    {
++        AudioAnalysis? pa = null, ra = null;
++        string? converted = null;
++
++        try { if (processed != null && File.Exists(processed)) pa = await Task.Run(() => AudioAnalyzer.AnalyzeWav(processed)); }
++        catch (Exception ex) { error ??= "Analysis failed: " + ex.Message; }
++        try { if (raw != null && File.Exists(raw)) ra = await Task.Run(() => AudioAnalyzer.AnalyzeWav(raw)); }
++        catch (Exception ex) { error ??= "Raw analysis failed: " + ex.Message; }
++
++        if (container != AudioTestContainer.Wav && processed != null && File.Exists(processed))
++        {
++            try { converted = await ConvertAsync(processed, container, aacKbps); }
++            catch (Exception ex) { error = (error == null ? "" : error + " ") + "Conversion failed: " + ex.Message; }
++        }
++
++        return new AudioTestResult(processed, raw, converted, report, pa, ra, error);
++    }
++
++    private static async Task<string> ConvertAsync(string wavPath, AudioTestContainer container, int aacKbps)
++    {
++        string ext = container switch { AudioTestContainer.Flac => ".flac", AudioTestContainer.Mp3 => ".mp3", _ => ".m4a" };
++        string outPath = Path.ChangeExtension(wavPath, ext);
++        var args = new System.Collections.Generic.List<string> { "-y", "-i", wavPath, "-vn" };
++        switch (container)
++        {
++            case AudioTestContainer.Flac: args.AddRange(new[] { "-c:a", "flac" }); break;
++            case AudioTestContainer.Mp3: args.AddRange(new[] { "-c:a", "libmp3lame", "-b:a", $"{aacKbps}k" }); break;
++            default: args.AddRange(new[] { "-c:a", "aac", "-b:a", $"{aacKbps}k" }); break;
++        }
++        args.Add(outPath);
++
++        var (code, err) = await FfmpegRunner.RunAsync(args);
++        if (code != 0 || !File.Exists(outPath))
++        {
++            var tail = string.Join(" | ", err.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).TakeLast(2));
++            throw new InvalidOperationException(tail.Length > 0 ? tail : $"ffmpeg exit code {code}");
++        }
++        return outPath;
++    }
++}
+diff --git a/src/ScreenRecorder.Infrastructure/Audio/StreamingResampler.cs b/src/ScreenRecorder.Infrastructure/Audio/StreamingResampler.cs
+new file mode 100644
+index 0000000..dbd513f
+--- /dev/null
++++ b/src/ScreenRecorder.Infrastructure/Audio/StreamingResampler.cs
+@@ -0,0 +1,75 @@
++using System;
++using NAudio.Dsp;
++
++namespace ScreenRecorder.Infrastructure.Audio;
++
++/// <summary>
++/// Потоковый ресемплер на базе WDL (NAudio). В отличие от WdlResamplingSampleProvider никогда не
++/// вызывает ресемплер с неполным входом: при нехватке данных WDL дополняет вход нулями, и в потоке
++/// появляются разрывы (щелчки). Здесь вход копится во внутренней очереди, а блок обрабатывается
++/// только когда накоплено ровно столько, сколько запросил ResamplePrepare.
++/// </summary>
++internal sealed class StreamingResampler
++{
++    private const int BlockFrames = 128;
++
++    private readonly WdlResampler _wdl = new();
++    private readonly int _ch;
++    private readonly float[] _block;
++    private float[] _fifo = new float[1 << 15];
++    private int _head;
++    private int _count; // в сэмплах (кадры * каналы)
++
++    public StreamingResampler(int inRate, int outRate, int channels)
++    {
++        _ch = channels;
++        _block = new float[BlockFrames * channels];
++        _wdl.SetMode(true, 2, false);
++        _wdl.SetFilterParms();
++        _wdl.SetFeedMode(false); // управление по выходу
++        _wdl.SetRates(inRate, outRate);
++    }
++
++    public void Push(float[] data, int sampleCount)
++    {
++        if (_head + _count + sampleCount > _fifo.Length)
++        {
++            if (_head > 0)
++            {
++                Array.Copy(_fifo, _head, _fifo, 0, _count);
++                _head = 0;
++            }
++            if (_count + sampleCount > _fifo.Length)
++                Array.Resize(ref _fifo, Math.Max(_fifo.Length * 2, _count + sampleCount));
++        }
++        Array.Copy(data, 0, _fifo, _head + _count, sampleCount);
++        _count += sampleCount;
++    }
++
++    /// <summary>Выдаёт столько выходных кадров, сколько позволяет накопленный вход. Возвращает число сэмплов.</summary>
++    public int Pull(float[] output)
++    {
++        int outFrames = 0;
++        int maxFrames = output.Length / _ch;
++        while (outFrames + BlockFrames <= maxFrames)
++        {
++            int need = _wdl.ResamplePrepare(BlockFrames, _ch, out float[] inBuf, out int inOff);
++            if (_count < need * _ch) break; // недостаточно входа: ждём следующий пакет
++            if (need > 0)
++            {
++                Array.Copy(_fifo, _head, inBuf, inOff, need * _ch);
++                _head += need * _ch;
++                _count -= need * _ch;
++                if (_count == 0) _head = 0;
++            }
++            // Важно: ResampleOut всегда получает нулевое смещение выходного буфера. При апсемплинге WDL
++            // применяет выходной IIR-фильтр с начала буфера, игнорируя смещение, и блоки со смещением
++            // оставались бы нефильтрованными (скачки на границах блоков).
++            int got = _wdl.ResampleOut(_block, 0, need, BlockFrames, _ch);
++            if (got <= 0 && need == 0) break;
++            Array.Copy(_block, 0, output, outFrames * _ch, got * _ch);
++            outFrames += got;
++        }
++        return outFrames * _ch;
++    }
++}
+diff --git a/src/ScreenRecorder.Infrastructure/Audio/WasapiAudioCapture.cs b/src/ScreenRecorder.Infrastructure/Audio/WasapiAudioCapture.cs
+index 409c463..1bbc148 100644
+--- a/src/ScreenRecorder.Infrastructure/Audio/WasapiAudioCapture.cs
++++ b/src/ScreenRecorder.Infrastructure/Audio/WasapiAudioCapture.cs
+@@ -1,79 +1,240 @@
+ using System;
++using System.Buffers;
++using System.Collections.Concurrent;
+ using System.Diagnostics;
++using System.IO;
+ using System.Linq;
++using System.Runtime;
++using System.Runtime.InteropServices;
+ using System.Threading;
+ using System.Threading.Tasks;
+ using NAudio.CoreAudioApi;
+ using NAudio.Wave;
+ using ScreenRecorder.Core.Interfaces;
++using ScreenRecorder.Core.Models;
+ 
+ namespace ScreenRecorder.Infrastructure.Audio;
+ 
+-public class WasapiAudioCapture : IAudioCapture
++/// <summary>
++/// Захват звука через WASAPI в WAV.
++/// Поток захвата NAudio делает минимум работы: копирует пакет в очередь и считает тайминги.
++/// Конвертация, фильтры, ресемплинг и запись на диск выполняются в отдельном потоке записи,
++/// поэтому медленный диск, ресемплер или нагрузка на UI не приводят к потере пакетов устройства.
++/// </summary>
++public sealed class WasapiAudioCapture : IAudioCapture
+ {
+-    private IWaveIn? _capture;
+-    private WaveFileWriter? _writer;
+-    private WaveFormat? _format;
++    [DllImport("avrt.dll", CharSet = CharSet.Unicode, SetLastError = true)]
++    private static extern IntPtr AvSetMmThreadCharacteristics(string taskName, ref uint taskIndex);
++
++    private readonly struct Chunk
++    {
++        public readonly byte[]? Data;
++        public readonly int Length;
++        public readonly long PadBytes;
++        private Chunk(byte[]? data, int length, long pad) { Data = data; Length = length; PadBytes = pad; }
++        public static Chunk Audio(byte[] data, int length) => new(data, length, 0);
++        public static Chunk Silence(long bytes) => new(null, 0, bytes);
++    }
++
+     private readonly ILoggerService _logger;
+     private readonly Stopwatch _clock = new();
+-    private readonly object _lock = new();
+-    private long _writtenBytes;
+-    private TaskCompletionSource? _stopped;
+-
+-    // Тишину в середине потока вставляем ТОЛЬКО для loopback (там пакеты реально не приходят при тишине).
+-    // Микрофон / виртуальный микрофон (iVCam) присылает данные непрерывно; нули посреди речи = треск.
+-    private bool _padGaps;
+-    private bool _first = true;
+-
+-    // Диагностика
+-    private long _paddedBytes, _packets;
+-    private double _maxGapMs;
++
++    private WasapiCapture? _capture;
++    private BlockingCollection<Chunk>? _queue;
++    private TaskCompletionSource? _finished;
++    private AudioCaptureSettings _settings = new();
++    private WaveFormat? _format;
++
++    // Состояние, которое пишет только поток захвата.
++    private bool _padGaps, _first, _boosted, _boostedOk;
++    private long _acceptedBytes, _paddedBytes, _packets;
++    private double _maxGapMs, _gapSumMs;
++    private int _lateCallbacks;
++    private volatile int _maxDepth;
+     private TimeSpan _lastPacketAt;
++    private double _lateThresholdMs;
++
++    private string _deviceName = "?";
++    private string _apiUsed = "";
++    private bool _gcChanged;
++    private GCLatencyMode _prevGcMode;
+ 
+     public WasapiAudioCapture(ILoggerService logger) => _logger = logger;
+ 
+-    public Task StartAsync(string deviceId, string outputPath, CancellationToken ct)
++    public bool IsRunning => _capture != null;
++    public string? LastError { get; private set; }
++    public AudioCaptureReport? LastReport { get; private set; }
++    public event Action<AudioLevel>? LevelMeasured;
++
++    public AudioCaptureStats? GetStats()
+     {
++        if (_queue == null && LastReport != null) return null;
++        long p = _packets;
++        return new AudioCaptureStats(p, _maxGapMs, p > 1 ? _gapSumMs / (p - 1) : 0, _lateCallbacks,
++            _queue?.Count ?? 0, _maxDepth, _clock.Elapsed.TotalSeconds);
++    }
++
++    public Task StartAsync(AudioCaptureRequest req, CancellationToken ct)
++    {
++        if (_capture != null)
++        {
++            _logger.Log("Audio: capture already running");
++            return Task.CompletedTask;
++        }
++
++        LastError = null;
++        LastReport = null;
++        var settings = req.Settings.Clone();
++        settings.Normalize();
++        _settings = settings;
++
+         try
+         {
+-            _logger.Log($"Audio: starting for '{deviceId}'");
+-            using var enumerator = new MMDeviceEnumerator();
+-            var device = FindDevice(enumerator, deviceId);
++            _logger.Log($"Audio: starting for '{req.DeviceId}'");
++            _logger.Log($"Audio settings: {settings.Describe()}");
+ 
++            using var enumerator = new MMDeviceEnumerator();
++            var device = FindDevice(enumerator, req.DeviceId);
+             if (device == null)
+             {
+                 device = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+                 _logger.Log($"Audio: device not found, fallback to default output '{device.FriendlyName}'");
+             }
+-
++            _deviceName = device.FriendlyName;
+             bool isRender = device.DataFlow == DataFlow.Render;
+-            _padGaps = isRender;
+ 
+-            // Формат НЕ навязываем: берём тот, в котором работает драйвер (mix format).
+-            _capture = isRender
+-                ? new WasapiLoopbackCapture(device)
+-                : new WasapiCapture(device, true, 50);   // event-driven, буфер 50 мс
++            // Основная попытка по настройкам пользователя, затем безопасный запасной вариант.
++            var attempts = new System.Collections.Generic.List<(AudioCaptureApi Api, bool Custom)>
++            {
++                (settings.Api, settings.RequestCustomDriverFormat)
++            };
++            if (!isRender && (settings.Api != AudioCaptureApi.WasapiEvent || settings.RequestCustomDriverFormat))
++                attempts.Add((AudioCaptureApi.WasapiEvent, false));
++
++            foreach (var attempt in attempts)
++            {
++                if (TryStart(device, isRender, attempt.Api, attempt.Custom, req, settings)) return Task.CompletedTask;
++            }
++
++            LastError ??= "Could not start audio capture (see log)";
++        }
++        catch (Exception ex)
++        {
++            LastError = ex.Message;
++            _logger.Log($"Audio Error: {ex}");
++        }
++        return Task.CompletedTask;
++    }
++
++    private bool TryStart(MMDevice device, bool isRender, AudioCaptureApi api, bool custom,
++        AudioCaptureRequest req, AudioCaptureSettings settings)
++    {
++        WasapiCapture? cap = null;
++        WaveFileWriter? writer = null, rawWriter = null;
++        BlockingCollection<Chunk>? queue = null;
++        try
++        {
++            cap = isRender ? new WasapiLoopbackCapture(device) : CreateMicCapture(device, api, custom, settings);
++            _apiUsed = isRender ? "WASAPI loopback (system audio)" :
++                $"WASAPI {(api == AudioCaptureApi.WasapiExclusive ? "exclusive" : "shared")}, " +
++                $"{(api == AudioCaptureApi.WasapiPolling ? "polling" : "event-driven")}, buffer {settings.BufferMs} ms";
+ 
+-            _format = _capture.WaveFormat;
+-            _logger.Log($"Audio: '{device.FriendlyName}' {(isRender ? "loopback" : "capture")} format: {_format}");
++            var fmt = cap.WaveFormat;
++            _format = fmt;
++            var chain = new AudioProcessingChain(fmt, settings);
++            writer = CreateWriter(req.OutputPath, chain.OutputFormat);
++            if (!string.IsNullOrEmpty(req.RawCopyPath))
++                rawWriter = CreateWriter(req.RawCopyPath, AudioFormatHelper.ToStandard(fmt));
+ 
+-            _writer = new WaveFileWriter(outputPath, _format);
+-            _writtenBytes = 0; _paddedBytes = 0; _packets = 0; _maxGapMs = 0;
+-            _first = true;
+-            _stopped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
++            _logger.Log($"Audio: '{_deviceName}' {_apiUsed}; driver {AudioFormatHelper.Describe(fmt)} -> " +
++                        $"output {AudioFormatHelper.Describe(chain.OutputFormat)}");
+ 
+-            _capture.DataAvailable += OnData;
+-            _capture.RecordingStopped += OnStopped;
++            // Сброс счётчиков.
++            _padGaps = isRender;
++            _first = true; _boosted = false; _boostedOk = false;
++            _acceptedBytes = 0; _paddedBytes = 0; _packets = 0;
++            _maxGapMs = 0; _gapSumMs = 0; _lateCallbacks = 0; _maxDepth = 0;
++            _lastPacketAt = TimeSpan.Zero;
++            _lateThresholdMs = Math.Max(60, settings.BufferMs * 1.5);
++
++            queue = new BlockingCollection<Chunk>(new ConcurrentQueue<Chunk>());
++            _queue = queue;
++            _finished = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+ 
++            if (settings.BoostThreadPriority)
++            {
++                _prevGcMode = GCSettings.LatencyMode;
++                try { GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency; _gcChanged = true; } catch { }
++            }
++
++            var w = writer; var r = rawWriter; var q = queue; var fin = _finished;
++
++            cap.DataAvailable += OnData;
++            cap.RecordingStopped += OnStopped;
++            _capture = cap;
+             _clock.Restart();
+-            _lastPacketAt = TimeSpan.Zero;
+-            _capture.StartRecording();
++            cap.StartRecording();
++
++            // Поток записи стартует только после успешного StartRecording: при ошибке старта
++            // нет «висящих» потоков, а пакеты, пришедшие раньше, просто ждут в очереди.
++            var thread = new Thread(() => WriterLoop(q, w, r, chain, fmt, fin))
++            {
++                IsBackground = true,
++                Name = "AudioWriter",
++                Priority = ThreadPriority.AboveNormal
++            };
++            thread.Start();
++            return true;
+         }
+         catch (Exception ex)
+         {
+-            _logger.Log($"Audio Error: {ex}");
++            LastError = ex.Message;
++            _logger.Log($"Audio: start failed ({(isRender ? "loopback" : $"{api}, custom={custom}")}): {ex.Message}");
++            try { queue?.CompleteAdding(); } catch { }
++            _capture = null;
++            _queue = null;
++            _finished = null;
++            try { cap?.Dispose(); } catch { }
++            try { writer?.Dispose(); } catch { }
++            try { rawWriter?.Dispose(); } catch { }
++            RestoreGc();
++            return false;
+         }
+-        return Task.CompletedTask;
++    }
++
++    private WasapiCapture CreateMicCapture(MMDevice device, AudioCaptureApi api, bool custom, AudioCaptureSettings s)
++    {
++        bool exclusive = api == AudioCaptureApi.WasapiExclusive;
++        bool eventSync = api != AudioCaptureApi.WasapiPolling;
++        var cap = new WasapiCapture(device, eventSync, s.BufferMs);
++        if (exclusive) cap.ShareMode = AudioClientShareMode.Exclusive;
++
++        WaveFormat? wanted = custom ? BuildDriverFormat(s) : null;
++        var check = wanted ?? cap.WaveFormat;
++        if (exclusive && !device.AudioClient.IsFormatSupported(AudioClientShareMode.Exclusive, check))
++        {
++            cap.Dispose();
++            throw new NotSupportedException(
++                $"Exclusive mode: driver does not accept {AudioFormatHelper.Describe(check)}");
++        }
++        // В shared-режиме NAudio включает AutoConvertPcm: Windows сама приведёт поток к запрошенному формату.
++        if (wanted != null) cap.WaveFormat = wanted;
++        return cap;
++    }
++
++    private static WaveFormat BuildDriverFormat(AudioCaptureSettings s) => s.DriverBitDepth switch
++    {
++        AudioBitDepth.Pcm16 => new WaveFormat(s.DriverSampleRate, 16, s.DriverChannels),
++        AudioBitDepth.Pcm24 => new WaveFormat(s.DriverSampleRate, 24, s.DriverChannels),
++        _ => WaveFormat.CreateIeeeFloatWaveFormat(s.DriverSampleRate, s.DriverChannels)
++    };
++
++    private static WaveFileWriter CreateWriter(string path, WaveFormat fmt)
++    {
++        var dir = Path.GetDirectoryName(Path.GetFullPath(path));
++        if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
++        var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read, 1 << 18);
++        return new WaveFileWriter(fs, fmt);
+     }
+ 
+     private static MMDevice? FindDevice(MMDeviceEnumerator en, string idOrName)
+@@ -85,73 +246,209 @@ public class WasapiAudioCapture : IAudioCapture
+             ?? all.FirstOrDefault(d => d.FriendlyName.Contains(idOrName, StringComparison.OrdinalIgnoreCase));
+     }
+ 
++    // ----- Поток захвата NAudio: только копирование и тайминги -----
+     private void OnData(object? s, WaveInEventArgs e)
+     {
+-        lock (_lock)
++        var q = _queue;
++        var fmt = _format;
++        if (q == null || fmt == null || e.BytesRecorded <= 0) return;
++
++        try
+         {
+-            if (_writer == null || _format == null) return;
++            if (!_boosted)
++            {
++                _boosted = true;
++                if (_settings.BoostThreadPriority) BoostCurrentThread();
++            }
+ 
+             var now = _clock.Elapsed;
+             _packets++;
+-            _maxGapMs = Math.Max(_maxGapMs, (now - _lastPacketAt).TotalMilliseconds);
++            if (_packets > 1)
++            {
++                double gap = (now - _lastPacketAt).TotalMilliseconds;
++                _gapSumMs += gap;
++                if (gap > _maxGapMs) _maxGapMs = gap;
++                if (!_padGaps && gap > _lateThresholdMs) _lateCallbacks++;
++            }
+             _lastPacketAt = now;
+ 
+-            // loopback — пэддинг всегда; микрофон — только перед самым первым пакетом (задержка старта устройства)
++            // Loopback: пакеты не приходят в тишине, заполняем паузы нулями по часам.
++            // Микрофон: только задержка старта устройства (перед первым пакетом); нули посреди речи дают треск.
+             if (_padGaps || _first)
+-                PadSilenceTo(BytesAt(now) - e.BytesRecorded);
++            {
++                long target = BytesAt(now, fmt) - e.BytesRecorded;
++                long gapBytes = target - _acceptedBytes;
++                if (gapBytes > BytesAt(TimeSpan.FromMilliseconds(50), fmt))
++                {
++                    gapBytes -= gapBytes % fmt.BlockAlign;
++                    q.Add(Chunk.Silence(gapBytes));
++                    _acceptedBytes += gapBytes;
++                    _paddedBytes += gapBytes;
++                }
++            }
+             _first = false;
+ 
+-            _writer.Write(e.Buffer, 0, e.BytesRecorded);
+-            _writtenBytes += e.BytesRecorded;
++            var buf = ArrayPool<byte>.Shared.Rent(e.BytesRecorded);
++            Buffer.BlockCopy(e.Buffer, 0, buf, 0, e.BytesRecorded);
++            q.Add(Chunk.Audio(buf, e.BytesRecorded));
++            _acceptedBytes += e.BytesRecorded;
++
++            int depth = q.Count;
++            if (depth > _maxDepth) _maxDepth = depth;
++        }
++        catch (InvalidOperationException) { /* очередь уже закрыта при остановке */ }
++    }
++
++    private void BoostCurrentThread()
++    {
++        try
++        {
++            uint index = 0;
++            _boostedOk = AvSetMmThreadCharacteristics("Pro Audio", ref index) != IntPtr.Zero;
++            Thread.CurrentThread.Priority = ThreadPriority.Highest;
++            _logger.Log($"Audio: capture thread boosted (MMCSS Pro Audio: {(_boostedOk ? "ok" : "unavailable")})");
++        }
++        catch (Exception ex)
++        {
++            _logger.Log($"Audio: could not boost capture thread: {ex.Message}");
+         }
+     }
+ 
+     private void OnStopped(object? s, StoppedEventArgs e)
+     {
+-        lock (_lock)
++        if (e.Exception != null)
++        {
++            LastError = e.Exception.Message;
++            _logger.Log($"Audio: stopped with error: {e.Exception.Message}");
++        }
++
++        var q = _queue;
++        var fmt = _format;
++        try
+         {
+-            if (e.Exception != null) _logger.Log($"Audio: stopped with error: {e.Exception.Message}");
+-            PadSilenceTo(BytesAt(_clock.Elapsed));      // хвост до реальной длительности
+-            _writer?.Dispose();                          // финализация WAV-заголовка
+-            _writer = null;
+-            _logger.Log($"Audio: {_packets} packets, max gap {_maxGapMs:F0} ms, padded {PaddedMs():F0} ms, " +
+-                        $"file {_writtenBytes / (double)(_format?.AverageBytesPerSecond ?? 1):F2} s");
++            // Хвост тишины до реальной длительности записи (как и раньше).
++            if (q != null && fmt != null && !q.IsAddingCompleted)
++            {
++                long gap = BytesAt(_clock.Elapsed, fmt) - _acceptedBytes;
++                if (gap > BytesAt(TimeSpan.FromMilliseconds(50), fmt))
++                {
++                    gap -= gap % fmt.BlockAlign;
++                    q.Add(Chunk.Silence(gap));
++                    _paddedBytes += gap;
++                    _acceptedBytes += gap;
++                }
++            }
+         }
+-        _capture?.Dispose();
+-        _capture = null;
+-        _stopped?.TrySetResult();
++        catch (InvalidOperationException) { }
++        try { q?.CompleteAdding(); } catch { }
++        try { _capture?.Dispose(); } catch { }
+     }
+ 
+     public async Task StopAsync()
+     {
+-        if (_capture == null) return;
+-        _capture.StopRecording();
+-        if (_stopped != null) await Task.WhenAny(_stopped.Task, Task.Delay(3000));
++        var cap = _capture;
++        var fin = _finished;
++        if (cap == null || fin == null) return;
++
++        try { cap.StopRecording(); } catch { }
++        if (await Task.WhenAny(fin.Task, Task.Delay(5000)) != fin.Task)
++        {
++            _logger.Log("Audio: RecordingStopped not received within 5 s, finalizing anyway");
++            try { _queue?.CompleteAdding(); } catch { }
++            await Task.WhenAny(fin.Task, Task.Delay(5000));
++        }
+     }
+ 
+-    private double PaddedMs() => _format == null ? 0 : _paddedBytes * 1000.0 / _format.AverageBytesPerSecond;
++    // ----- Поток записи: конвертация, фильтры, ресемплинг, диск -----
++    private void WriterLoop(BlockingCollection<Chunk> q, WaveFileWriter writer, WaveFileWriter? raw,
++        AudioProcessingChain chain, WaveFormat fmt, TaskCompletionSource fin)
++    {
++        try
++        {
++            Action<byte[], int> sink = (b, n) => writer.Write(b, 0, n);
++            int zeroLen = 16 * 1024;
++            zeroLen -= zeroLen % fmt.BlockAlign;
++            if (zeroLen < fmt.BlockAlign) zeroLen = fmt.BlockAlign;
++            var zeros = new byte[zeroLen];
++            var levelClock = Stopwatch.StartNew();
++
++            foreach (var c in q.GetConsumingEnumerable())
++            {
++                if (c.Data != null)
++                {
++                    raw?.Write(c.Data, 0, c.Length);
++                    chain.Process(c.Data, c.Length, sink);
++                    ArrayPool<byte>.Shared.Return(c.Data);
++                }
++                else
++                {
++                    long remaining = c.PadBytes;
++                    while (remaining > 0)
++                    {
++                        int n = (int)Math.Min(remaining, zeros.Length);
++                        raw?.Write(zeros, 0, n);
++                        chain.Process(zeros, n, sink);
++                        remaining -= n;
++                    }
++                }
+ 
+-    private long BytesAt(TimeSpan t)
++                if (levelClock.ElapsedMilliseconds >= 100)
++                {
++                    levelClock.Restart();
++                    try { LevelMeasured?.Invoke(chain.TakeLevel()); } catch { }
++                }
++            }
++        }
++        catch (Exception ex)
++        {
++            LastError = ex.Message;
++            _logger.Log($"Audio writer error: {ex}");
++            // Очищаем очередь, чтобы поток захвата не копил память.
++            try { foreach (var _ in q.GetConsumingEnumerable()) { } } catch { }
++        }
++        finally
++        {
++            try { writer.Dispose(); } catch (Exception ex) { _logger.Log($"Audio: closing WAV failed: {ex.Message}"); }
++            try { raw?.Dispose(); } catch { }
++            FinishReport(fmt, chain);
++            _capture = null;
++            _queue = null;
++            RestoreGc();
++            fin.TrySetResult();
++        }
++    }
++
++    private void FinishReport(WaveFormat fmt, AudioProcessingChain chain)
+     {
+-        if (_format == null) return 0;
+-        long b = (long)(t.TotalSeconds * _format.AverageBytesPerSecond);
+-        return b - b % _format.BlockAlign;
++        _clock.Stop();
++        double paddedMs = _paddedBytes * 1000.0 / fmt.AverageBytesPerSecond;
++        double durationSec = _acceptedBytes / (double)fmt.AverageBytesPerSecond;
++        double avgGap = _packets > 1 ? _gapSumMs / (_packets - 1) : 0;
++
++        string? notes = null;
++        if (!_padGaps && (_lateCallbacks > 0 || _maxGapMs > _settings.BufferMs * 3))
++            notes = $"Packets arrived late {_lateCallbacks} time(s), max gap {_maxGapMs:F0} ms: the capture thread was " +
++                    "starved or the driver stalled. Try a larger buffer, polling mode, or a lower load (FPS/encoder).";
++        if (LastError != null) notes = (notes == null ? "" : notes + " ") + $"Error: {LastError}";
++
++        LastReport = new AudioCaptureReport(_deviceName, _apiUsed, AudioFormatHelper.Describe(fmt),
++            AudioFormatHelper.Describe(chain.OutputFormat), _packets, _maxGapMs, avgGap, _lateCallbacks,
++            paddedMs, durationSec, _maxDepth, _boostedOk, notes);
++
++        _logger.Log($"Audio: {_packets} packets, max gap {_maxGapMs:F0} ms, late {_lateCallbacks}, " +
++                    $"padded {paddedMs:F0} ms, file {durationSec:F2} s");
+     }
+ 
+-    private void PadSilenceTo(long targetBytes)
++    private void RestoreGc()
+     {
+-        if (_writer == null || _format == null) return;
+-        long gap = targetBytes - _writtenBytes;
+-        if (gap <= BytesAt(TimeSpan.FromMilliseconds(50))) return;
++        if (!_gcChanged) return;
++        _gcChanged = false;
++        try { GCSettings.LatencyMode = _prevGcMode; } catch { }
++    }
+ 
+-        gap -= gap % _format.BlockAlign;
+-        var zeros = new byte[16 * 1024 - (16 * 1024 % _format.BlockAlign)];
+-        while (gap > 0)
+-        {
+-            int n = (int)Math.Min(gap, zeros.Length);
+-            _writer.Write(zeros, 0, n);
+-            _writtenBytes += n; _paddedBytes += n;
+-            gap -= n;
+-        }
++    private static long BytesAt(TimeSpan t, WaveFormat f)
++    {
++        long b = (long)(t.TotalSeconds * f.AverageBytesPerSecond);
++        return b - b % f.BlockAlign;
+     }
+ }
+diff --git a/src/ScreenRecorder.Infrastructure/Encoding/FFmpegEncoder.cs b/src/ScreenRecorder.Infrastructure/Encoding/FFmpegEncoder.cs
+index fe99f29..a103f89 100644
+--- a/src/ScreenRecorder.Infrastructure/Encoding/FFmpegEncoder.cs
++++ b/src/ScreenRecorder.Infrastructure/Encoding/FFmpegEncoder.cs
+@@ -28,7 +28,7 @@ public class FFmpegEncoder
+         }
+     }
+ 
+-    public void Start(string outputPath, int width, int height, int fps, int bitrate, string? audioDeviceName = null)
++    public void Start(string outputPath, int width, int height, int fps, int bitrate, string? audioDeviceName = null, bool lowPriority = true)
+     {
+         width = (width / 2) * 2;
+         height = (height / 2) * 2;
+@@ -56,6 +56,12 @@ public class FFmpegEncoder
+         _process.ErrorDataReceived += (s, e) => { if (e.Data != null) _uiLogger.Log($"FFmpeg: {e.Data}"); };
+         _process.Start();
+         _process.BeginErrorReadLine();
++        if (lowPriority)
++        {
++            // Кодирование не должно отнимать процессорное время у потока захвата звука.
++            try { _process.PriorityClass = ProcessPriorityClass.BelowNormal; }
++            catch (Exception ex) { _uiLogger.Log($"FFmpeg: could not lower priority: {ex.Message}"); }
++        }
+     }
+ 
+     public void Stop()
+diff --git a/src/ScreenRecorder.Infrastructure/Encoding/FfmpegRunner.cs b/src/ScreenRecorder.Infrastructure/Encoding/FfmpegRunner.cs
+new file mode 100644
+index 0000000..9bd6d71
+--- /dev/null
++++ b/src/ScreenRecorder.Infrastructure/Encoding/FfmpegRunner.cs
+@@ -0,0 +1,30 @@
++using System;
++using System.Collections.Generic;
++using System.Diagnostics;
++using System.Threading;
++using System.Threading.Tasks;
++
++namespace ScreenRecorder.Infrastructure.Encoding;
++
++/// <summary>Запуск ffmpeg как дочернего процесса. Аргументы передаются списком (без склейки в строку).</summary>
++public static class FfmpegRunner
++{
++    public static async Task<(int ExitCode, string StdErr)> RunAsync(IEnumerable<string> args, CancellationToken ct = default)
++    {
++        var psi = new ProcessStartInfo("ffmpeg")
++        {
++            UseShellExecute = false,
++            RedirectStandardError = true,
++            RedirectStandardOutput = true,
++            CreateNoWindow = true
++        };
++        foreach (var a in args) psi.ArgumentList.Add(a);
++
++        using var p = Process.Start(psi) ?? throw new InvalidOperationException("ffmpeg did not start");
++        var err = p.StandardError.ReadToEndAsync();
++        var outp = p.StandardOutput.ReadToEndAsync();
++        await p.WaitForExitAsync(ct);
++        await outp;
++        return (p.ExitCode, await err);
++    }
++}
+diff --git a/src/ScreenRecorder.Infrastructure/Recording/RecordingSession.cs b/src/ScreenRecorder.Infrastructure/Recording/RecordingSession.cs
+index 24776f0..5edd0ba 100644
+--- a/src/ScreenRecorder.Infrastructure/Recording/RecordingSession.cs
++++ b/src/ScreenRecorder.Infrastructure/Recording/RecordingSession.cs
+@@ -20,6 +20,7 @@ public class RecordingSession : IRecordingSession
+     private Stopwatch _stopwatch = new();
+     private System.Timers.Timer _timer;
+     private string? _tempAudioPath;
++    private AudioCaptureSettings _audioSettings = new();
+     private string? _finalVideoPath;
+ 
+     public RecordingSession(IVideoCapture videoCapture, IAudioCapture audioCapture, FFmpegEncoder encoder, ILoggerService logger)
+@@ -41,15 +42,17 @@ public class RecordingSession : IRecordingSession
+     {
+         _finalVideoPath = options.OutputPath;
+         _tempAudioPath = Path.ChangeExtension(options.OutputPath, ".wav");
++        _audioSettings = options.AudioSettings?.Clone() ?? new AudioCaptureSettings();
++        _audioSettings.Normalize();
+         
+         // 1. Стартуем видео (без аудио внутри FFmpeg)
+-        _encoder.Start(options.OutputPath + ".tmp.mp4", options.Source.Width, options.Source.Height, options.FramesPerSecond, options.VideoBitrateKbps, null);
++        _encoder.Start(options.OutputPath + ".tmp.mp4", options.Source.Width, options.Source.Height, options.FramesPerSecond, options.VideoBitrateKbps, null, _audioSettings.LowerEncoderPriority);
+         await _videoCapture.StartAsync(options, ct);
+ 
+         // 2. Стартуем аудио отдельно через NAudio
+         if (options.SystemAudioDeviceId != "None" && !string.IsNullOrEmpty(options.SystemAudioDeviceId))
+         {
+-            await _audioCapture.StartAsync(options.SystemAudioDeviceId, _tempAudioPath, ct);
++            await _audioCapture.StartAsync(new AudioCaptureRequest(options.SystemAudioDeviceId, _tempAudioPath, _audioSettings), ct);
+         }
+ 
+         _stopwatch.Restart();
+@@ -68,21 +71,42 @@ public class RecordingSession : IRecordingSession
+         _encoder.Stop();
+ 
+         // 3. Склеиваем видео и аудио
++        var tempVideo = _finalVideoPath + ".tmp.mp4";
+         if (File.Exists(_tempAudioPath))
+         {
+             _logger.Log("Merging video and audio...");
+-            var tempVideo = _finalVideoPath + ".tmp.mp4";
+-            var args = $"-y -i \"{tempVideo}\" -i \"{_tempAudioPath}\" -c:v copy -c:a aac \"{_finalVideoPath}\"";
+-            
+-            var process = Process.Start(new ProcessStartInfo("ffmpeg", args) { CreateNoWindow = true, UseShellExecute = false });
+-            process?.WaitForExit();
+-            
+-            try { File.Delete(tempVideo); File.Delete(_tempAudioPath); } catch {}
+-            _logger.Log("Merge complete.");
++            try
++            {
++                var (code, err) = await FfmpegRunner.RunAsync(new[]
++                {
++                    "-y", "-i", tempVideo, "-i", _tempAudioPath,
++                    "-map", "0:v:0", "-map", "1:a:0",
++                    "-c:v", "copy", "-c:a", "aac", "-b:a", $"{_audioSettings.AacBitrateKbps}k",
++                    _finalVideoPath
++                });
++                if (code == 0 && File.Exists(_finalVideoPath))
++                {
++                    try { File.Delete(tempVideo); File.Delete(_tempAudioPath); } catch { }
++                    _logger.Log("Merge complete.");
++                }
++                else
++                {
++                    // Не теряем запись: оставляем видео без звука и исходный WAV рядом.
++                    _logger.Log($"Merge FAILED (ffmpeg exit {code}). Video saved without audio; WAV kept: {_tempAudioPath}");
++                    var tail = string.Join(" | ", err.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).TakeLast(2));
++                    if (tail.Length > 0) _logger.Log($"FFmpeg: {tail}");
++                    if (File.Exists(tempVideo)) File.Move(tempVideo, _finalVideoPath, true);
++                }
++            }
++            catch (Exception ex)
++            {
++                _logger.Log($"Merge error: {ex.Message}. Video saved without audio; WAV kept: {_tempAudioPath}");
++                if (File.Exists(tempVideo)) File.Move(tempVideo, _finalVideoPath, true);
++            }
+         }
+         else
+         {
+-            File.Move(_finalVideoPath + ".tmp.mp4", _finalVideoPath, true);
++            File.Move(tempVideo, _finalVideoPath, true);
+         }
+ 
+         State = RecordingState.Idle;
+diff --git a/tools/AudioChainSelfTest/AudioChainSelfTest.csproj b/tools/AudioChainSelfTest/AudioChainSelfTest.csproj
+new file mode 100644
+index 0000000..d68b002
+--- /dev/null
++++ b/tools/AudioChainSelfTest/AudioChainSelfTest.csproj
+@@ -0,0 +1,12 @@
++<Project Sdk="Microsoft.NET.Sdk">
++  <PropertyGroup>
++    <OutputType>Exe</OutputType>
++    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
++    <ImplicitUsings>enable</ImplicitUsings>
++    <Nullable>enable</Nullable>
++  </PropertyGroup>
++  <ItemGroup>
++    <ProjectReference Include="..\..\src\ScreenRecorder.Core\ScreenRecorder.Core.csproj" />
++    <ProjectReference Include="..\..\src\ScreenRecorder.Infrastructure\ScreenRecorder.Infrastructure.csproj" />
++  </ItemGroup>
++</Project>
+diff --git a/tools/AudioChainSelfTest/Program.cs b/tools/AudioChainSelfTest/Program.cs
+new file mode 100644
+index 0000000..af74284
+--- /dev/null
++++ b/tools/AudioChainSelfTest/Program.cs
+@@ -0,0 +1,163 @@
++// Самотест цепочки обработки звука (без устройств и без WPF): ресемплинг, EQ, фильтр, каналы, форматы, анализатор.
++// Запуск: dotnet run --project tools/AudioChainSelfTest -c Release   (код возврата 0 = все проверки прошли)
++using NAudio.Wave;
++using ScreenRecorder.Core.Models;
++using ScreenRecorder.Infrastructure.Audio;
++
++int fails = 0;
++void Check(string name, bool ok, string detail = "") { Console.WriteLine($"{(ok ? "PASS" : "FAIL")}  {name}  {detail}"); if (!ok) fails++; }
++
++static byte[] FloatBytes(float[] s) { var b = new byte[s.Length * 4]; Buffer.BlockCopy(s, 0, b, 0, b.Length); return b; }
++
++static float[] Sine(int rate, int ch, double sec, double freq, double amp, Func<int,int,double>? chAmp = null)
++{
++    int n = (int)(rate * sec); var d = new float[n * ch];
++    for (int i = 0; i < n; i++) for (int c = 0; c < ch; c++)
++        d[i * ch + c] = (float)(amp * (chAmp?.Invoke(c, i) ?? 1.0) * Math.Sin(2 * Math.PI * freq * i / rate));
++    return d;
++}
++
++// Прогон через цепочку; возвращает выходные float и формат.
++static (float[] data, WaveFormat fmt, byte[] raw) Run(float[] input, int rate, int ch, AudioCaptureSettings s, int[] chunkFrames)
++{
++    var fmt = WaveFormat.CreateIeeeFloatWaveFormat(rate, ch);
++    var chain = new AudioProcessingChain(fmt, s);
++    var bytes = FloatBytes(input);
++    var ms = new MemoryStream();
++    int pos = 0, k = 0, frameBytes = fmt.BlockAlign;
++    while (pos < bytes.Length)
++    {
++        int len = Math.Min(chunkFrames[k++ % chunkFrames.Length] * frameBytes, bytes.Length - pos);
++        var chunk = new byte[len]; Buffer.BlockCopy(bytes, pos, chunk, 0, len);
++        chain.Process(chunk, len, (b, n) => ms.Write(b, 0, n));
++        pos += len;
++    }
++    var raw = ms.ToArray();
++    var of = chain.OutputFormat;
++    var outF = new float[raw.Length / (of.BitsPerSample / 8)];
++    AudioFormatHelper.Decode(raw, outF.Length, of, outF);
++    return (outF, of, raw);
++}
++
++static double Rms(float[] d, int from = 0) { double s = 0; int n = 0; for (int i = from; i < d.Length; i++) { s += d[i] * d[i]; n++; } return Math.Sqrt(s / Math.Max(1, n)); }
++static double MaxJump(float[] d, int ch) { double m = 0; for (int i = ch; i < d.Length; i++) m = Math.Max(m, Math.Abs(d[i] - d[i - ch])); return m; }
++
++var plain = new AudioCaptureSettings { Dither = false, OutputBitDepth = AudioBitDepth.Float32 };
++
++// 1. Ресемплинг 48k stereo -> 16k mono, без щелчков, длина верная
++{
++    var s = plain.Clone(); s.OutputSampleRate = 16000; s.ChannelMode = AudioChannelMode.Mono;
++    var inp = Sine(48000, 2, 5, 440, 0.5);
++    var (o, f, _) = Run(inp, 48000, 2, s, new[] { 480 });
++    double expectFrames = 5 * 16000;
++    Check("48k->16k length", Math.Abs(o.Length - expectFrames) < 400, $"frames={o.Length} expected~{expectFrames}");
++    double maxJ = MaxJump(o, 1), theory = 2 * Math.PI * 440 / 16000 * 0.5;
++    Check("48k->16k no discontinuities", maxJ <= theory * 1.15, $"maxJump={maxJ:F4} theory={theory:F4}");
++    Check("48k->16k amplitude", Math.Abs(Rms(o, 2000) - 0.5 / Math.Sqrt(2)) < 0.02, $"rms={Rms(o, 2000):F4}");
++}
++// 2. Результат не зависит от размера пакетов (в том числе нерегулярных)
++{
++    var s = plain.Clone(); s.OutputSampleRate = 16000; s.ChannelMode = AudioChannelMode.Mono;
++    var inp = Sine(48000, 2, 3, 700, 0.4);
++    var (a, _, ra) = Run(inp, 48000, 2, s, new[] { 480 });
++    var (b, _, rb) = Run(inp, 48000, 2, s, new[] { 37, 1000, 480, 101, 4800, 7 });
++    int n = Math.Min(a.Length, b.Length); double md = 0; for (int i = 0; i < n; i++) md = Math.Max(md, Math.Abs(a[i] - b[i]));
++    Check("chunk-size independent", md < 1e-4 && Math.Abs(a.Length - b.Length) < 300, $"maxDiff={md:E2} len {a.Length} vs {b.Length}");
++}
++// 3. Апсемплинг 16k -> 48k и 44.1k -> 48k
++foreach (var (inRate, freq) in new[] { (16000, 300.0), (44100, 1000.0), (8000, 200.0) })
++{
++    var s = plain.Clone(); s.OutputSampleRate = 48000;
++    var inp = Sine(inRate, 1, 3, freq, 0.5);
++    var (o, _, _) = Run(inp, inRate, 1, s, new[] { 160 });
++    double maxJ = MaxJump(o, 1), theory = 2 * Math.PI * freq / 48000 * 0.5;
++    Check($"{inRate}->48k continuity", maxJ <= theory * 1.2 && Math.Abs(o.Length - 3 * 48000) < 1000, $"maxJump={maxJ:F4} theory={theory:F4} len={o.Length}");
++}
++{
++    var s = plain.Clone(); s.OutputSampleRate = 48000;
++    var inp = Sine(16000, 1, 3, 300, 0.5);
++    var (a, _, _) = Run(inp, 16000, 1, s, new[] { 160 });
++    var (b, _, _) = Run(inp, 16000, 1, s, new[] { 5, 1600, 33, 160 });
++    int n = Math.Min(a.Length, b.Length); double md = 0; for (int i = 0; i < n; i++) md = Math.Max(md, Math.Abs(a[i] - b[i]));
++    Check("upsample chunk-size independent", md < 1e-4, $"maxDiff={md:E2}");
++}
++// 4. Усиление +6 dB
++{
++    var s = plain.Clone(); s.InputGainDb = 6;
++    var (o, _, _) = Run(Sine(48000, 1, 1, 1000, 0.2), 48000, 1, s, new[] { 480 });
++    Check("gain +6 dB", Math.Abs(Rms(o) / (0.2 / Math.Sqrt(2)) - 1.995) < 0.02, $"ratio={Rms(o) / (0.2 / Math.Sqrt(2)):F3}");
++}
++// 5. Эквалайзер: полоса 1 кГц +6 dB
++{
++    var s = plain.Clone(); s.Equalizer.Enabled = true; s.Equalizer.BandGainsDb[5] = 6;
++    var (o, _, _) = Run(Sine(48000, 1, 1, 1000, 0.2), 48000, 1, s, new[] { 480 });
++    double ratio = Rms(o, 4800) / (0.2 / Math.Sqrt(2));
++    var s2 = plain.Clone(); s2.Equalizer.Enabled = true; s2.Equalizer.BandGainsDb[5] = 6;
++    var (o2, _, _) = Run(Sine(48000, 1, 1, 8000, 0.2), 48000, 1, s2, new[] { 480 });
++    double ratioFar = Rms(o2, 4800) / (0.2 / Math.Sqrt(2));
++    Check("EQ 1k +6 dB boosts 1 kHz", Math.Abs(ratio - 1.995) < 0.1, $"ratio={ratio:F3}");
++    Check("EQ 1k band leaves 8 kHz alone", Math.Abs(ratioFar - 1.0) < 0.1, $"ratio={ratioFar:F3}");
++}
++// 6. Фильтр НЧ 200 Гц гасит 50 Гц и не трогает 1 кГц
++{
++    var s = plain.Clone(); s.HighPassHz = 200;
++    var (lo, _, _) = Run(Sine(48000, 1, 1, 50, 0.5), 48000, 1, s, new[] { 480 });
++    var (hi, _, _) = Run(Sine(48000, 1, 1, 1000, 0.5), 48000, 1, s, new[] { 480 });
++    Check("HPF attenuates 50 Hz", Rms(lo, 4800) < 0.5 / Math.Sqrt(2) * 0.1, $"rms={Rms(lo, 4800):F4}");
++    Check("HPF passes 1 kHz", Math.Abs(Rms(hi, 4800) / (0.5 / Math.Sqrt(2)) - 1) < 0.05, $"ratio={Rms(hi, 4800) / (0.5 / Math.Sqrt(2)):F3}");
++}
++// 7. Режимы каналов (L = синус, R = тишина)
++{
++    var inp = Sine(48000, 2, 1, 1000, 0.5, (c, i) => c == 0 ? 1.0 : 0.0);
++    foreach (var (mode, expectCh, expectRms) in new[] { (AudioChannelMode.LeftOnly, 1, 0.3536), (AudioChannelMode.RightOnly, 1, 0.0), (AudioChannelMode.Mono, 1, 0.1768), (AudioChannelMode.Stereo, 2, 0.3536), (AudioChannelMode.Auto, 2, 0.3536) })
++    {
++        var s = plain.Clone(); s.ChannelMode = mode;
++        var (o, f, _) = Run(inp, 48000, 2, s, new[] { 480 });
++        double r = Rms(o);
++        if (mode == AudioChannelMode.Stereo || mode == AudioChannelMode.Auto) { var l = o.Where((x, i) => i % 2 == 0).ToArray(); r = Rms(l); }
++        Check($"channel mode {mode}", f.Channels == expectCh && Math.Abs(r - expectRms) < 0.01, $"ch={f.Channels} rms={r:F4}");
++    }
++    var s1 = plain.Clone(); s1.ChannelMode = AudioChannelMode.Stereo;
++    var (dup, df, _) = Run(Sine(48000, 1, 1, 1000, 0.5), 48000, 1, s1, new[] { 480 });
++    Check("mono source -> stereo duplicates", df.Channels == 2 && Math.Abs(dup[100] - dup[101]) < 1e-6);
++}
++// 8. Форматы вывода + анализатор
++{
++    foreach (var depth in new[] { AudioBitDepth.Pcm16, AudioBitDepth.Pcm24, AudioBitDepth.Float32 })
++    {
++        var s = new AudioCaptureSettings { OutputBitDepth = depth, OutputSampleRate = 16000, ChannelMode = AudioChannelMode.Mono };
++        var (o, f, raw) = Run(Sine(48000, 2, 4, 500, 0.4), 48000, 2, s, new[] { 480 });
++        string path = Path.Combine(Path.GetTempPath(), $"sr_selftest_{depth}.wav");
++        using (var w = new WaveFileWriter(path, f)) w.Write(raw, 0, raw.Length);
++        var a = AudioAnalyzer.AnalyzeWav(path);
++        Check($"output {depth} analyze clean", a.Clicks == 0 && a.Dropouts == 0 && a.SampleRate == 16000 && Math.Abs(a.DurationSec - 4) < 0.05,
++            $"clicks={a.Clicks} dropouts={a.Dropouts} rate={a.SampleRate} dur={a.DurationSec:F2} rms={a.RmsDb:F1}dB");
++    }
++}
++// 9. Анализатор находит дефекты
++{
++    var f = new WaveFormat(48000, 16, 1);
++    short[] Make(Action<short[]> mut) { var d = new short[48000 * 4]; for (int i = 0; i < d.Length; i++) d[i] = (short)(0.3 * 32767 * Math.Sin(2 * Math.PI * 300 * i / 48000) * (0.6 + 0.4 * Math.Sin(2 * Math.PI * 3 * i / 48000)) + (Random.Shared.NextDouble() - .5) * 20); mut(d); return d; }
++    AudioAnalysis An(short[] d, string name) { var p = Path.Combine(Path.GetTempPath(), $"sr_selftest_{name}.wav"); using (var w = new WaveFileWriter(p, f)) { var b = new byte[d.Length * 2]; Buffer.BlockCopy(d, 0, b, 0, b.Length); w.Write(b, 0, b.Length); } return AudioAnalyzer.AnalyzeWav(p); }
++    var clean = An(Make(_ => { }), "clean");
++    var gap = An(Make(d => { for (int i = 96000; i < 96000 + 480; i++) d[i] = 0; }), "gap");
++    var click = An(Make(d => { for (int k = 1; k <= 8; k++) { int p = k * 20000; d[p] = (short)(d[p] > 0 ? -20000 : 20000); } }), "click");
++    var clip = An(Make(d => { for (int i = 50000; i < 50400; i++) d[i] = 32767; }), "clip");
++    Check("analyzer: clean has no defects", clean.Clicks == 0 && clean.Dropouts == 0, $"clicks={clean.Clicks} dropouts={clean.Dropouts} {clean.Verdict}");
++    Check("analyzer: finds 10 ms zero gap", gap.Dropouts == 1, $"dropouts={gap.Dropouts}");
++    Check("analyzer: finds clicks", click.Clicks >= 6, $"clicks={click.Clicks} perMin={click.ClicksPerMinute:F0}");
++    Check("analyzer: finds clipping", clip.ClippedSamples >= 300, $"clipped={clip.ClippedSamples}");
++}
++// 10. Settings: Normalize / Clone / битый JSON
++{
++    var bad = new AudioCaptureSettings { BufferMs = -5, DriverSampleRate = 47000, DriverChannels = 9, InputGainDb = float.NaN, HighPassHz = 5, AacBitrateKbps = 1, OutputSampleRate = 5 };
++    bad.Equalizer = new EqualizerSettings { BandGainsDb = new float[] { 99, -99, float.NaN } };
++    bad.Normalize();
++    Check("settings normalize", bad.BufferMs == 10 && bad.DriverSampleRate == 48000 && bad.DriverChannels == 2 && bad.InputGainDb == 0 && bad.HighPassHz == 20 && bad.AacBitrateKbps == 64 && bad.OutputSampleRate == 8000 && bad.Equalizer.BandGainsDb.Length == 10 && bad.Equalizer.BandGainsDb[0] == 12 && bad.Equalizer.BandGainsDb[1] == -12 && bad.Equalizer.BandGainsDb[2] == 0);
++    var json = System.Text.Json.JsonSerializer.Serialize(new AudioCaptureSettings { Api = AudioCaptureApi.WasapiPolling });
++    var back = System.Text.Json.JsonSerializer.Deserialize<AudioCaptureSettings>(json)!;
++    Check("settings json roundtrip", back.Api == AudioCaptureApi.WasapiPolling && back.Equalizer.BandGainsDb.Length == 10);
++    var c = back.Clone(); c.Equalizer.BandGainsDb[0] = 5; Check("clone is deep", back.Equalizer.BandGainsDb[0] == 0);
++}
++Console.WriteLine(fails == 0 ? "\nALL PASS" : $"\n{fails} FAILED");
++return fails == 0 ? 0 : 1;

@@ -27,6 +27,8 @@ public partial class MainViewModel : ObservableObject
     private string? _lastFilePath;
     private RecordingOverlayWindow? _overlay;
     private RegionSelectionWindow? _regionWindow;
+    private readonly Func<AudioSettingsViewModel> _audioVmFactory;
+    private AudioSettingsWindow? _audioWindow;
 
     public ObservableCollection<RecordingFile> SavedFiles { get; } = new();
     public ObservableCollection<AudioDevice> AudioDevices { get; } = new();
@@ -44,6 +46,7 @@ public partial class MainViewModel : ObservableObject
     [ObservableProperty] private string? _logoPath;
     [ObservableProperty] private LogoPosition _selectedLogoPosition = LogoPosition.TopRight;
     [ObservableProperty] private string _currentView = "Home"; // Home, General, Video, Image, About
+    [ObservableProperty] private string _outputFolder = "";
 
     [RelayCommand] private void SetView(string view) => CurrentView = view;
 
@@ -68,12 +71,15 @@ public partial class MainViewModel : ObservableObject
 
     public ObservableCollection<CaptureSource> AvailableSources { get; } = new();
 
-    public MainViewModel(IRecordingSession session, ICaptureSourceProvider sourceProvider, ILoggerService logger, SettingsService settings)
+    public MainViewModel(IRecordingSession session, ICaptureSourceProvider sourceProvider, ILoggerService logger, SettingsService settings,
+        Func<AudioSettingsViewModel> audioVmFactory)
     {
         _session = session;
         _sourceProvider = sourceProvider;
         _logger = logger;
         _settings = settings;
+        _audioVmFactory = audioVmFactory;
+        OutputFolder = _settings.Current.OutputFolder;
 
         // Загружаем настройки логотипа
         ShowLogo = _settings.Current.ShowLogo;
@@ -141,11 +147,13 @@ public partial class MainViewModel : ObservableObject
     {
         if (_sourceProvider is WindowsGraphicsCaptureSourceProvider provider)
         {
+            // Запоминаем выбор до Clear(): иначе сброс на "No Audio" затирал LastAudioDevice в настройках.
+            string? keep = SelectedAudioDevice?.Name ?? _settings.Current.LastAudioDevice;
             var devices = provider.GetAudioDevices();
             AudioDevices.Clear();
             AudioDevices.Add(new AudioDevice("None", "No Audio", false));
             foreach (var d in devices) AudioDevices.Add(d);
-            SelectedAudioDevice = AudioDevices.FirstOrDefault();
+            SelectedAudioDevice = AudioDevices.FirstOrDefault(d => d.Name == keep) ?? AudioDevices.FirstOrDefault();
         }
     }
 
@@ -181,7 +189,8 @@ public partial class MainViewModel : ObservableObject
 
         string? audioId = SelectedAudioDevice?.Id;
  
-        var options = new RecordingOptions(capSource, AudioSourceMode.System, audioId, null, _lastFilePath, 30, 8000, ShowCursor, ShowLogo, LogoPath, LogoText, LogoOpacity, LogoScale, SelectedLogoPosition);
+        var options = new RecordingOptions(capSource, AudioSourceMode.System, audioId, null, _lastFilePath, 30, 8000, ShowCursor, ShowLogo, LogoPath, LogoText, LogoOpacity, LogoScale, SelectedLogoPosition,
+            _settings.Current.Audio.Clone());
         _logger.Log($"START: {capSource.Width}x{capSource.Height} at {capSource.X},{capSource.Y} Audio ID: {audioId}. Cursor: {ShowCursor}. Logo: {ShowLogo}");
         await _session.StartAsync(options, CancellationToken.None);
     }
@@ -198,9 +207,21 @@ public partial class MainViewModel : ObservableObject
     [RelayCommand] public void RefreshFiles() {
         SavedFiles.Clear();
         if (!Directory.Exists(_settings.Current.OutputFolder)) return;
-        var files = Directory.GetFiles(_settings.Current.OutputFolder, "*.mp4")
-            .Select(f => new RecordingFile(f, new FileInfo(f).Name, new FileInfo(f).CreationTime, $"{(new FileInfo(f).Length / 1024.0 / 1024.0):F2} MB"))
-            .OrderByDescending(f => f.CreatedAt);
+        var root = _settings.Current.OutputFolder;
+        var found = new System.Collections.Generic.List<string>();
+        try { found.AddRange(Directory.GetFiles(root, "*.mp4")); } catch { }
+        // Тестовые записи звука лежат в подпапке AudioTests.
+        var tests = Path.Combine(root, "AudioTests");
+        if (Directory.Exists(tests))
+        {
+            try { found.AddRange(Directory.GetFiles(tests).Where(f => new[] { ".wav", ".flac", ".mp3", ".m4a" }
+                .Contains(Path.GetExtension(f).ToLowerInvariant()))); } catch { }
+        }
+        var files = found
+            .Select(f => new FileInfo(f))
+            .OrderByDescending(fi => fi.CreationTime)
+            .Select(fi => new RecordingFile(fi.FullName, Path.GetRelativePath(root, fi.FullName), fi.CreationTime,
+                $"{(fi.Length / 1024.0 / 1024.0):F2} MB"));
         foreach (var f in files) SavedFiles.Add(f);
     }
 
@@ -238,10 +259,77 @@ public partial class MainViewModel : ObservableObject
         }
     }
 
-    [RelayCommand] private void OpenSettings() {
-        var dialog = new Microsoft.Win32.OpenFolderDialog();
-        if (dialog.ShowDialog() == true) { _settings.Current.OutputFolder = dialog.FolderName; _settings.Save(); RefreshFiles(); }
+    [RelayCommand] private void OpenSettings() => ChooseOutputFolder();
+
+    // ----- Папка для записей по умолчанию -----
+    [RelayCommand]
+    private void ChooseOutputFolder()
+    {
+        var dialog = new Microsoft.Win32.OpenFolderDialog
+        {
+            Title = "Default folder for recordings",
+            InitialDirectory = Directory.Exists(OutputFolder) ? OutputFolder : Environment.GetFolderPath(Environment.SpecialFolder.MyVideos)
+        };
+        if (dialog.ShowDialog() == true) TrySetOutputFolder(dialog.FolderName);
     }
+
+    [RelayCommand]
+    private void ResetOutputFolder() =>
+        TrySetOutputFolder(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyVideos), "ScreenRecorder"));
+
+    [RelayCommand]
+    private void OpenOutputFolder()
+    {
+        try
+        {
+            Directory.CreateDirectory(OutputFolder);
+            Process.Start(new ProcessStartInfo(OutputFolder) { UseShellExecute = true });
+        }
+        catch (Exception ex) { MessageBox.Show($"Cannot open folder: {ex.Message}"); }
+    }
+
+    /// <summary>Проверяет, что в папку можно писать, и только после этого запоминает её.</summary>
+    private bool TrySetOutputFolder(string path)
+    {
+        try
+        {
+            Directory.CreateDirectory(path);
+            var probe = Path.Combine(path, ".write_test_" + Guid.NewGuid().ToString("N"));
+            File.WriteAllText(probe, "x");
+            File.Delete(probe);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show($"Cannot use this folder:\n{path}\n\n{ex.Message}", "Recordings folder");
+            return false;
+        }
+        _settings.Current.OutputFolder = path;
+        _settings.Save();
+        OutputFolder = path;
+        RefreshFiles();
+        _logger.Log($"Recordings folder: {path}");
+        return true;
+    }
+
+    [RelayCommand]
+    private void OpenAudioSettings()
+    {
+        if (_audioWindow != null) { _audioWindow.Activate(); return; }
+        var vm = _audioVmFactory();
+        _audioWindow = new AudioSettingsWindow(vm) { Owner = Application.Current.MainWindow };
+        _audioWindow.Closed += (s, e) =>
+        {
+            _audioWindow = null;
+            // Устройство могли сменить в окне настроек: читаем его ДО перезагрузки списка,
+            // потому что перезагрузка сама перезаписывает LastAudioDevice.
+            var last = _settings.Current.LastAudioDevice;
+            LoadAudioDevices();
+            var dev = AudioDevices.FirstOrDefault(d => d.Name == last);
+            if (dev != null) SelectedAudioDevice = dev;
+        };
+        _audioWindow.Show();
+    }
+
     [RelayCommand] private async Task RefreshSourcesAsync() {
         var sources = await _sourceProvider.GetSourcesAsync(SelectedCaptureMode, CancellationToken.None);
         AvailableSources.Clear();
