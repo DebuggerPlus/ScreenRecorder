@@ -1,11 +1,12 @@
 using System;
-using System.IO;
 using System.Diagnostics;
+using System.IO;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using ScreenRecorder.Core.Enums;
 using ScreenRecorder.Core.Interfaces;
 using ScreenRecorder.Core.Models;
-using ScreenRecorder.Core.Enums;
 using ScreenRecorder.Infrastructure.Encoding;
 
 namespace ScreenRecorder.Infrastructure.Recording;
@@ -17,10 +18,11 @@ public class RecordingSession : IRecordingSession
     private readonly FFmpegEncoder _encoder;
     private readonly ILoggerService _logger;
     private RecordingState _state = RecordingState.Idle;
-    private Stopwatch _stopwatch = new();
-    private System.Timers.Timer _timer;
+    private readonly Stopwatch _stopwatch = new();
+    private readonly System.Timers.Timer _timer;
     private string? _tempAudioPath;
     private AudioCaptureSettings _audioSettings = new();
+    private VideoEncodingSettings _videoSettings = new();
     private string? _finalVideoPath;
 
     public RecordingSession(IVideoCapture videoCapture, IAudioCapture audioCapture, FFmpegEncoder encoder, ILoggerService logger)
@@ -40,53 +42,98 @@ public class RecordingSession : IRecordingSession
 
     public async Task StartAsync(RecordingOptions options, CancellationToken ct)
     {
+        // Раньше двойной старт (двойной клик по кнопке) поднимал ВТОРОЙ ffmpeg и второй цикл захвата
+        // в тот же файл — в логе за 11.11 это видно как два START подряд, и mp4 в итоге не собрался.
+        if (_state is RecordingState.Preparing or RecordingState.Recording or RecordingState.Stopping)
+        {
+            _logger.Log($"START ignored: запись уже идёт (state={_state})");
+            return;
+        }
+
+        State = RecordingState.Preparing;
         _finalVideoPath = options.OutputPath;
         _tempAudioPath = Path.ChangeExtension(options.OutputPath, ".wav");
         _audioSettings = options.AudioSettings?.Clone() ?? new AudioCaptureSettings();
         _audioSettings.Normalize();
-        
-        // 1. Стартуем видео (без аудио внутри FFmpeg)
-        _encoder.Start(options.OutputPath + ".tmp.mp4", options.Source.Width, options.Source.Height, options.FramesPerSecond, options.VideoBitrateKbps, null, _audioSettings.LowerEncoderPriority);
-        await _videoCapture.StartAsync(options, ct);
-
-        // 2. Стартуем аудио отдельно через NAudio
-        if (options.SystemAudioDeviceId != "None" && !string.IsNullOrEmpty(options.SystemAudioDeviceId))
+        _videoSettings = options.Video?.Clone() ?? new VideoEncodingSettings
         {
-            await _audioCapture.StartAsync(new AudioCaptureRequest(options.SystemAudioDeviceId, _tempAudioPath, _audioSettings), ct);
-        }
+            Fps = options.FramesPerSecond > 0 ? options.FramesPerSecond : 30,
+            RateControl = VideoRateControl.Bitrate,
+            BitrateKbps = options.VideoBitrateKbps > 0 ? options.VideoBitrateKbps : 12000
+        };
+        _videoSettings.Normalize();
 
-        _stopwatch.Restart();
-        _timer.Start();
-        State = RecordingState.Recording;
+        _logger.Log($"Recording profile: {_videoSettings.Describe()}");
+        _logger.Log($"Audio settings: {_audioSettings.Describe()}");
+
+        try
+        {
+            // 1. Стартуем видео (без аудио внутри FFmpeg)
+            await _encoder.StartAsync(options.OutputPath + ".tmp.mp4", options.Source.Width, options.Source.Height, _videoSettings, _audioSettings.LowerEncoderPriority);
+            await _videoCapture.StartAsync(options, ct);
+
+            // 2. Стартуем аудио отдельно через NAudio
+            if (!string.IsNullOrEmpty(options.SystemAudioDeviceId) && options.SystemAudioDeviceId != "None")
+            {
+                await _audioCapture.StartAsync(new AudioCaptureRequest(options.SystemAudioDeviceId, _tempAudioPath, _audioSettings), ct);
+            }
+
+            _stopwatch.Restart();
+            _timer.Start();
+            State = RecordingState.Recording;
+        }
+        catch (Exception ex)
+        {
+            _logger.Log($"START FAILED: {ex.Message}");
+            try { _encoder.Stop(); } catch { }
+            State = RecordingState.Idle;
+        }
     }
 
     public async Task StopAsync(CancellationToken ct)
     {
+        if (_state != RecordingState.Recording)
+        {
+            _logger.Log($"STOP ignored: запись не идёт (state={_state})");
+            return;
+        }
+
         State = RecordingState.Stopping;
         _timer.Stop();
         _stopwatch.Stop();
 
-        await _videoCapture.StopAsync(ct);
-        await _audioCapture.StopAsync();
-        _encoder.Stop();
+        try { await _videoCapture.StopAsync(ct); } catch (Exception ex) { _logger.Log($"video stop: {ex.Message}"); }
+        try { await _audioCapture.StopAsync(); } catch (Exception ex) { _logger.Log($"audio stop: {ex.Message}"); }
+        try { _encoder.Stop(); } catch (Exception ex) { _logger.Log($"encoder stop: {ex.Message}"); }
+
+        var tempVideo = _finalVideoPath + ".tmp.mp4";
+
+        if (!File.Exists(tempVideo))
+        {
+            _logger.Log($"STOP: {tempVideo} не создан — видео нет (проверьте профиль и лог FFmpeg).");
+            State = RecordingState.Idle;
+            return;
+        }
 
         // 3. Склеиваем видео и аудио
-        var tempVideo = _finalVideoPath + ".tmp.mp4";
-        if (File.Exists(_tempAudioPath))
+        if (!string.IsNullOrEmpty(_tempAudioPath) && File.Exists(_tempAudioPath))
         {
             _logger.Log("Merging video and audio...");
             try
             {
-                var (code, err) = await FfmpegRunner.RunAsync(new[]
+                var mergeArgs = new[]
                 {
                     "-y", "-i", tempVideo, "-i", _tempAudioPath,
                     "-map", "0:v:0", "-map", "1:a:0",
                     "-c:v", "copy", "-c:a", "aac", "-b:a", $"{_audioSettings.AacBitrateKbps}k",
-                    _finalVideoPath
-                });
-                if (code == 0 && File.Exists(_finalVideoPath))
+                    "-shortest",
+                    _finalVideoPath!
+                };
+                var (code, err) = await FfmpegRunner.RunAsync(mergeArgs);
+                if (code == 0 && File.Exists(_finalVideoPath!))
                 {
-                    try { File.Delete(tempVideo); File.Delete(_tempAudioPath); } catch { }
+                    try { File.Delete(tempVideo); } catch { }
+                    try { File.Delete(_tempAudioPath); } catch { }
                     _logger.Log("Merge complete.");
                 }
                 else
@@ -95,18 +142,19 @@ public class RecordingSession : IRecordingSession
                     _logger.Log($"Merge FAILED (ffmpeg exit {code}). Video saved without audio; WAV kept: {_tempAudioPath}");
                     var tail = string.Join(" | ", err.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).TakeLast(2));
                     if (tail.Length > 0) _logger.Log($"FFmpeg: {tail}");
-                    if (File.Exists(tempVideo)) File.Move(tempVideo, _finalVideoPath, true);
+                    try { File.Move(tempVideo, _finalVideoPath!, true); } catch { }
                 }
             }
             catch (Exception ex)
             {
                 _logger.Log($"Merge error: {ex.Message}. Video saved without audio; WAV kept: {_tempAudioPath}");
-                if (File.Exists(tempVideo)) File.Move(tempVideo, _finalVideoPath, true);
+                try { File.Move(tempVideo, _finalVideoPath!, true); } catch { }
             }
         }
         else
         {
-            File.Move(tempVideo, _finalVideoPath, true);
+            try { File.Move(tempVideo, _finalVideoPath!, true); }
+            catch (Exception ex) { _logger.Log($"Could not finalize {_finalVideoPath}: {ex.Message}"); }
         }
 
         State = RecordingState.Idle;

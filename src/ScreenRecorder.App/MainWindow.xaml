@@ -37,6 +37,7 @@
                 <Button Content="General" Command="{Binding SetViewCommand}" CommandParameter="General" Style="{StaticResource NavButtonStyle}"/>
                 <Button Content="Video" Command="{Binding SetViewCommand}" CommandParameter="Video" Style="{StaticResource NavButtonStyle}"/>
                 <Button Content="Image" Command="{Binding SetViewCommand}" CommandParameter="Image" Style="{StaticResource NavButtonStyle}"/>
+                <Button Content="Help" Command="{Binding OpenHelpCommand}" Style="{StaticResource NavButtonStyle}"/>
                 <Button Content="About" Command="{Binding SetViewCommand}" CommandParameter="About" Style="{StaticResource NavButtonStyle}"/>
                 
                 <Border Height="2" Background="#444" Margin="10,20"/>
@@ -44,6 +45,7 @@
                 <Button Content="Audio Settings" Command="{Binding OpenAudioSettingsCommand}" Style="{StaticResource NavButtonStyle}"/>
                 <Button Content="Test Sync" Command="{Binding OpenSyncTestCommand}" Style="{StaticResource NavButtonStyle}"/>
                 <Button Content="Recordings" Command="{Binding OpenRecordingsWindowCommand}" Style="{StaticResource NavButtonStyle}"/>
+                <Button Content="Process Video" Command="{Binding OpenVideoProcessingCommand}" Style="{StaticResource NavButtonStyle}"/>
             </StackPanel>
         </Border>
 
@@ -93,6 +95,12 @@
                               DisplayMemberPath="Name" Height="35" Margin="0,0,0,10"/>
                     <Button Content="Refresh Audio Sources" Command="{Binding RefreshAudioSourcesCommand}" Height="30" Margin="0,0,0,10"/>
                     <Button Content="Audio Settings, Equalizer and Test..." Command="{Binding OpenAudioSettingsCommand}" Height="30" Margin="0,0,0,20"/>
+
+                    <TextBlock Text="Audio from phone (PhoneAudioRecorder)" FontSize="16" FontWeight="SemiBold" Margin="0,0,0,10"/>
+                    <CheckBox Content="Audio from phone (PhoneAudioRecorder)" IsChecked="{Binding PhoneAudioEnabled}" FontSize="14" Margin="0,0,0,10"/>
+                    <TextBlock Text="Phone IP:" Margin="0,0,0,4"/>
+                    <TextBox Text="{Binding PhoneAudioHost, UpdateSourceTrigger=PropertyChanged}" Height="30" Margin="0,0,0,8"/>
+                    <TextBlock Text="{Binding PhoneAudioStatus}" FontSize="11" Foreground="DarkGreen" TextWrapping="Wrap" Margin="0,0,0,20"/>
                 </StackPanel>
 
                 <!-- Video / Logo Settings View -->
@@ -153,6 +161,68 @@
                                         </ContentControl>
                                     </Grid>
                                 </Border>
+                            </StackPanel>
+                        </GroupBox>
+
+                        <GroupBox Header="Encoding profile — внешний config (configs\*.json)" Padding="10" Margin="0,15,0,0">
+                            <StackPanel>
+                                <ComboBox ItemsSource="{Binding Profiles}" SelectedItem="{Binding SelectedProfile}" DisplayMemberPath="DisplayName" Height="30"/>
+                                <TextBlock Text="{Binding SelectedProfile.ShortDescription}" FontSize="11" Foreground="#555" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                                <TextBlock Text="{Binding SelectedProfile.FilePath}" FontSize="10" Foreground="Gray" TextWrapping="Wrap" Margin="0,2,0,10"/>
+
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="70"/><ColumnDefinition Width="*"/><ColumnDefinition Width="70"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                    <TextBlock Text="FPS" Grid.Column="0" VerticalAlignment="Center"/>
+                                    <ComboBox Grid.Column="1" ItemsSource="{Binding FpsChoices}" SelectedItem="{Binding ProfileFps}" Height="28" Margin="0,0,10,0"/>
+                                    <TextBlock Text="Encoder" Grid.Column="2" VerticalAlignment="Center"/>
+                                    <ComboBox Grid.Column="3" ItemsSource="{Binding EncoderChoices}" SelectedItem="{Binding ProfileEncoder}" Height="28"/>
+                                </Grid>
+
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="70"/><ColumnDefinition Width="*"/><ColumnDefinition Width="70"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                    <TextBlock Text="Preset" Grid.Column="0" VerticalAlignment="Center"/>
+                                    <ComboBox Grid.Column="1" ItemsSource="{Binding PresetChoices}" SelectedItem="{Binding ProfilePreset}" Height="28" Margin="0,0,10,0"/>
+                                    <TextBlock Text="Rate" Grid.Column="2" VerticalAlignment="Center"/>
+                                    <ComboBox Grid.Column="3" ItemsSource="{Binding RateControlChoices}" SelectedItem="{Binding ProfileRateControl}" Height="28"/>
+                                </Grid>
+
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="70"/><ColumnDefinition Width="*"/><ColumnDefinition Width="70"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                    <TextBlock Text="CRF" Grid.Column="0" VerticalAlignment="Center"/>
+                                    <TextBox Grid.Column="1" Text="{Binding ProfileCrf}" Height="28" Margin="0,0,10,0"/>
+                                    <TextBlock Text="kbps" Grid.Column="2" VerticalAlignment="Center"/>
+                                    <TextBox Grid.Column="3" Text="{Binding ProfileBitrateKbps}" Height="28"/>
+                                </Grid>
+
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="70"/><ColumnDefinition Width="*"/><ColumnDefinition Width="70"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                                    <TextBlock Text="PixFmt" Grid.Column="0" VerticalAlignment="Center"/>
+                                    <ComboBox Grid.Column="1" ItemsSource="{Binding PixelFormatChoices}" SelectedItem="{Binding ProfilePixelFormat}" Height="28" Margin="0,0,10,0"/>
+                                    <TextBlock Text="AAC kbps" Grid.Column="2" VerticalAlignment="Center"/>
+                                    <TextBox Grid.Column="3" Text="{Binding ProfileAacKbps}" Height="28"/>
+                                </Grid>
+
+                                <CheckBox Content="Применять и аудио из профиля (усиление, AAC, float32)" IsChecked="{Binding ProfileApplyAudio}" Margin="0,4,0,4"/>
+                                <Grid>
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="70"/><ColumnDefinition Width="*"/><ColumnDefinition Width="60"/></Grid.ColumnDefinitions>
+                                    <TextBlock Text="Gain dB" Grid.Column="0" VerticalAlignment="Center"/>
+                                    <Slider Grid.Column="1" Minimum="-30" Maximum="30" TickFrequency="1" IsSnapToTickEnabled="True" Value="{Binding ProfileGainDb}"/>
+                                    <TextBlock Grid.Column="2" Text="{Binding ProfileGainDb}" HorizontalAlignment="Right" VerticalAlignment="Center"/>
+                                </Grid>
+
+                                <TextBlock Text="{Binding ProfileWarnings}" Foreground="DarkOrange" FontSize="11" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                                <TextBlock Text="Команда ffmpeg для этого профиля:" FontSize="11" Margin="0,8,0,2"/>
+                                <TextBox Text="{Binding ProfileArgsPreview}" IsReadOnly="True" FontFamily="Consolas" FontSize="11" TextWrapping="Wrap" Height="62" VerticalScrollBarVisibility="Auto" Background="#F7F7F7"/>
+
+                                <WrapPanel Margin="0,8,0,0">
+                                    <Button Content="Apply" Command="{Binding ApplyProfileCommand}" Height="28" Margin="0,0,6,6" Padding="10,0"/>
+                                    <Button Content="Save file" Command="{Binding SaveProfileCommand}" Height="28" Margin="0,0,6,6" Padding="10,0"/>
+                                    <Button Content="Save as..." Command="{Binding SaveProfileAsCommand}" Height="28" Margin="0,0,6,6" Padding="10,0"/>
+                                    <Button Content="Reload list" Command="{Binding ReloadProfilesCommand}" Height="28" Margin="0,0,6,6" Padding="10,0"/>
+                                    <Button Content="Open configs folder" Command="{Binding OpenConfigsFolderCommand}" Height="28" Margin="0,0,6,6" Padding="10,0"/>
+                                    <Button Content="Copy args" Command="{Binding CopyProfileArgsCommand}" Height="28" Margin="0,0,6,6" Padding="10,0"/>
+                                </WrapPanel>
+                                <TextBlock Text="{Binding ProfileStatus}" FontSize="11" Foreground="DarkGreen" TextWrapping="Wrap" Margin="0,4,0,0"/>
                             </StackPanel>
                         </GroupBox>
                     </StackPanel>

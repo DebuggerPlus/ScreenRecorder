@@ -16,4 +16,8 @@
     <ProjectReference Include="..\ScreenRecorder.Core\ScreenRecorder.Core.csproj" />
     <ProjectReference Include="..\ScreenRecorder.Infrastructure\ScreenRecorder.Infrastructure.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- Модель rnnoise для фильтра arnndn (шумоподавление речи) кладём рядом с exe. -->
+    <Content Include="..\..\models\rnnoise\*.rnnn" Link="models\rnnoise\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>

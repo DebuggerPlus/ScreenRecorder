@@ -62,6 +62,16 @@ public interface IRecordingSession {
     event Action<TimeSpan>? Tick;
 }
 
+public interface IVideoProcessor {
+    bool IsRunning { get; }
+    /// <summary>Читает параметры файла через ffprobe (нет ffprobe — вернёт MediaInfo.Empty).</summary>
+    Task<MediaInfo> ProbeAsync(string path, CancellationToken ct = default);
+    /// <summary>Обрабатывает файл целиком (или отрезок, если задан LimitSeconds) и пишет новый файл.</summary>
+    Task<VideoProcessingResult> RunAsync(VideoProcessingSettings settings, IProgress<VideoProcessingProgress>? progress, CancellationToken ct = default);
+    /// <summary>Прерывает текущий прогон (kill процесса ffmpeg).</summary>
+    void Cancel();
+}
+
 public interface ILoggerService {
     ObservableCollection<string> LogEntries { get; }
     void Log(string message);
