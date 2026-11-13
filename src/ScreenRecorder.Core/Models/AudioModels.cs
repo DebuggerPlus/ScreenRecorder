@@ -101,6 +101,17 @@ public sealed class AudioCaptureSettings
     // --- Итоговая AAC-дорожка в MP4 ---
     public int AacBitrateKbps { get; set; } = 192;
 
+    // --- Шумоподавление при съёмке ---
+    // Звук при записи идёт через NAudio в WAV, а тяжёлые фильтры (afftdn, arnndn) — ffmpeg-ные: в живой
+    // поток их не вставить. Поэтому выбранный рецепт применяется к WAV в момент склейки с видео —
+    // файл сразу получается чистым, отдельная операция «Process the whole file» не нужна.
+    /// <summary>true = применить выбранный рецепт к звуку записи при склейке (см. RecordingDenoise).</summary>
+    public bool DenoiseOnRecord { get; set; }
+    /// <summary>Имя рецепта из <see cref="NoiseReductionSettings.Recipes"/>.</summary>
+    public string DenoiseRecipe { get; set; } = NoiseReductionSettings.DefaultRecipe;
+    /// <summary>true = не удалять исходный WAV после склейки (звук «до» шумоподавления).</summary>
+    public bool KeepRawAudio { get; set; }
+
     public static readonly int[] AllowedDriverRates = { 8000, 16000, 22050, 32000, 44100, 48000, 88200, 96000 };
 
     public AudioCaptureSettings Clone() => new()
@@ -112,8 +123,21 @@ public sealed class AudioCaptureSettings
         OutputSampleRate = OutputSampleRate, OutputBitDepth = OutputBitDepth, ChannelMode = ChannelMode,
         InputGainDb = InputGainDb, HighPassHz = HighPassHz, Dither = Dither,
         Equalizer = (Equalizer ?? new EqualizerSettings()).Clone(),
-        AacBitrateKbps = AacBitrateKbps
+        AacBitrateKbps = AacBitrateKbps,
+        DenoiseOnRecord = DenoiseOnRecord, DenoiseRecipe = DenoiseRecipe, KeepRawAudio = KeepRawAudio
     };
+
+    /// <summary>
+    /// Переносит пользовательские настройки шумоподавления из настройки звука (Audio Settings).
+    /// Профиль кодирования — это пресет видео (и усиление/битрейт), он не решает за пользователя,
+    /// чистить ли шум: иначе применённый профиль молча выключает шумоподавление при съёмке.
+    /// </summary>
+    public void CopyDenoiseFrom(AudioCaptureSettings user)
+    {
+        DenoiseOnRecord = user.DenoiseOnRecord;
+        DenoiseRecipe = user.DenoiseRecipe;
+        KeepRawAudio = user.KeepRawAudio;
+    }
 
     /// <summary>Приводит значения к допустимым (на случай повреждённого JSON).</summary>
     public void Normalize()
@@ -125,6 +149,8 @@ public sealed class AudioCaptureSettings
         InputGainDb = float.IsFinite(InputGainDb) ? Math.Clamp(InputGainDb, -30f, 30f) : 0f;
         HighPassHz = HighPassHz <= 0 ? 0 : Math.Clamp(HighPassHz, 20, 500);
         AacBitrateKbps = Math.Clamp(AacBitrateKbps, 64, 512);
+        // Неизвестное имя рецепта (правили JSON руками) не должно ломать запись — берём рабочий дефолт.
+        if (!NoiseReductionSettings.Recipes.Contains(DenoiseRecipe)) DenoiseRecipe = NoiseReductionSettings.DefaultRecipe;
         Equalizer ??= new EqualizerSettings();
         Equalizer.Normalize();
     }
@@ -139,6 +165,7 @@ public sealed class AudioCaptureSettings
         sb.Append($", out={(OutputSampleRate == 0 ? "src" : OutputSampleRate + "Hz")}/{OutputBitDepth}/{ChannelMode}");
         sb.Append(CultureInfo.InvariantCulture, $", gain={InputGainDb:0.#}dB, hp={(HighPassHz == 0 ? "off" : HighPassHz + "Hz")}");
         sb.Append($", eq={(Equalizer.Enabled ? Equalizer.Preset : "off")}, dither={Dither}, boost={BoostThreadPriority}, aac={AacBitrateKbps}k");
+        sb.Append($", denoise={(DenoiseOnRecord ? DenoiseRecipe : "off")}{(DenoiseOnRecord && KeepRawAudio ? " (+raw kept)" : "")}");
         return sb.ToString();
     }
 }

@@ -56,7 +56,8 @@ public partial class AudioSettingsViewModel : ObservableObject
         nameof(DriverBitDepth), nameof(DriverChannels), nameof(BoostThreadPriority), nameof(LowerEncoderPriority),
         nameof(OutputSampleRate), nameof(OutputBitDepth), nameof(ChannelMode), nameof(InputGainDb),
         nameof(HighPassHz), nameof(Dither), nameof(AacBitrateKbps), nameof(EqEnabled), nameof(EqPreset),
-        nameof(SaveRawCopy), nameof(TestContainer), nameof(AutoStopSeconds)
+        nameof(SaveRawCopy), nameof(TestContainer), nameof(AutoStopSeconds),
+        nameof(DenoiseOnRecord), nameof(DenoiseRecipe), nameof(KeepRawAudio)
     };
 
     // ----- Списки выбора -----
@@ -116,6 +117,7 @@ public partial class AudioSettingsViewModel : ObservableObject
         new Option<int>("30 seconds", 30), new Option<int>("60 seconds", 60),
     };
     public IReadOnlyList<string> EqPresetNames { get; } = EqualizerPresets.Names;
+    public IReadOnlyList<string> DenoiseRecipeNames { get; } = NoiseReductionSettings.Recipes;
 
     // ----- Источник -----
     [ObservableProperty] private AudioDeviceItem? _selectedDevice;
@@ -143,6 +145,11 @@ public partial class AudioSettingsViewModel : ObservableObject
     // ----- Эквалайзер -----
     [ObservableProperty] private bool _eqEnabled;
     [ObservableProperty] private string _eqPreset = "Flat";
+
+    // ----- Шумоподавление при съёмке -----
+    [ObservableProperty] private bool _denoiseOnRecord;
+    [ObservableProperty] private string _denoiseRecipe = NoiseReductionSettings.DefaultRecipe;
+    [ObservableProperty] private bool _keepRawAudio;
 
     // ----- Тест -----
     [ObservableProperty] private bool _saveRawCopy = true;
@@ -204,6 +211,7 @@ public partial class AudioSettingsViewModel : ObservableObject
             OutputSampleRate = a.OutputSampleRate; OutputBitDepth = a.OutputBitDepth; ChannelMode = a.ChannelMode;
             InputGainDb = a.InputGainDb; HighPassHz = a.HighPassHz; Dither = a.Dither; AacBitrateKbps = a.AacBitrateKbps;
             EqEnabled = a.Equalizer.Enabled; EqPreset = a.Equalizer.Preset;
+            DenoiseOnRecord = a.DenoiseOnRecord; DenoiseRecipe = a.DenoiseRecipe; KeepRawAudio = a.KeepRawAudio;
             for (int i = 0; i < Bands.Count; i++) Bands[i].GainDb = a.Equalizer.BandGainsDb[i];
         }
         finally { _loading = false; }
@@ -219,6 +227,7 @@ public partial class AudioSettingsViewModel : ObservableObject
         a.OutputSampleRate = OutputSampleRate; a.OutputBitDepth = OutputBitDepth; a.ChannelMode = ChannelMode;
         a.InputGainDb = InputGainDb; a.HighPassHz = HighPassHz; a.Dither = Dither; a.AacBitrateKbps = AacBitrateKbps;
         a.Equalizer.Enabled = EqEnabled; a.Equalizer.Preset = EqPreset;
+        a.DenoiseOnRecord = DenoiseOnRecord; a.DenoiseRecipe = DenoiseRecipe; a.KeepRawAudio = KeepRawAudio;
         for (int i = 0; i < Bands.Count; i++) a.Equalizer.BandGainsDb[i] = Bands[i].GainDb;
         a.Normalize();
         // Устройство пишем только если его меняли в этом окне: иначе простое открытие окна
@@ -269,6 +278,24 @@ public partial class AudioSettingsViewModel : ObservableObject
     }
 
     [RelayCommand] private void ResetEqualizer() => EqPreset = "Flat";
+
+    // ----- Шумоподавление при съёмке -----
+    /// <summary>Что именно уйдёт в ffmpeg на склейке — видно в окне, без догадок.</summary>
+    public string DenoiseChainText
+    {
+        get
+        {
+            if (!DenoiseOnRecord) return "Off: the recording is saved exactly as captured.";
+            var probe = new AudioCaptureSettings { DenoiseOnRecord = true, DenoiseRecipe = DenoiseRecipe };
+            var chain = RecordingDenoise.BuildChain(probe);
+            return chain.Length == 0
+                ? $"Recipe \"{DenoiseRecipe}\" filters nothing - the recording is saved as captured."
+                : "ffmpeg -af " + chain;
+        }
+    }
+
+    partial void OnDenoiseOnRecordChanged(bool value) => OnPropertyChanged(nameof(DenoiseChainText));
+    partial void OnDenoiseRecipeChanged(string value) => OnPropertyChanged(nameof(DenoiseChainText));
 
     // ----- Устройства -----
     [RelayCommand]

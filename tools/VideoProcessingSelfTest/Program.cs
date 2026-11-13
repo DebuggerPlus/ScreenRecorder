@@ -202,6 +202,60 @@ string ExtractWav(string media, string name)
         def.IsEnabled && def.RnnEnabled && def.HighPassHz == 100, def.Describe());
 }
 
+// ---------- 1b. Шумоподавление при съёмке: план склейки (без ffmpeg) ----------
+{
+    string Ch(NoiseReductionSettings n) { var l = new List<string>(); n.AppendFilters(l); return string.Join(",", l); }
+
+    var off = new AudioCaptureSettings();
+    Check("record denoise: off by default = no filter", RecordingDenoise.BuildChain(off) == "", off.Describe());
+    Check("record denoise: default recipe = the working one",
+        off.DenoiseRecipe == NoiseReductionSettings.DefaultRecipe, off.DenoiseRecipe);
+
+    var on = new AudioCaptureSettings { DenoiseOnRecord = true };
+    Check("record denoise: on = default recipe chain",
+        RecordingDenoise.BuildChain(on) == "highpass=f=100:poles=2,arnndn=m=models/rnnoise/bd.rnnn:mix=1",
+        RecordingDenoise.BuildChain(on));
+    Check("record denoise: on = the same chain as the Process Video window",
+        RecordingDenoise.BuildChain(on) == Ch(NoiseReductionSettings.CreateDefault()), RecordingDenoise.BuildChain(on));
+
+    on.DenoiseRecipe = "Fan / hum";
+    Check("record denoise: recipe 'Fan / hum' = hp150 + spectral",
+        RecordingDenoise.BuildChain(on).StartsWith("highpass=f=150:poles=2,afftdn="), RecordingDenoise.BuildChain(on));
+
+    on.DenoiseRecipe = "All off";
+    Check("record denoise: recipe 'All off' = no filter", RecordingDenoise.BuildChain(on) == "", RecordingDenoise.BuildChain(on));
+
+    on.DenoiseRecipe = "No such recipe";
+    Check("record denoise: unknown recipe = no filter, no crash", RecordingDenoise.BuildChain(on) == "", RecordingDenoise.BuildChain(on));
+
+    off.Normalize();
+    Check("record denoise: broken recipe name is repaired on load",
+        off.DenoiseRecipe == NoiseReductionSettings.DefaultRecipe, off.DenoiseRecipe);
+
+    // Профиль кодирования не управляет шумоподавлением: в нём живёт аудио-пресет (усиление, битрейт),
+    // и раньше его применение молча выключало шумоподавление при съёмке. Значения берём из Audio Settings.
+    var fromProfile = new AudioCaptureSettings { DenoiseOnRecord = false, DenoiseRecipe = "All off", KeepRawAudio = false, InputGainDb = 15 };
+    var fromUser = new AudioCaptureSettings { DenoiseOnRecord = true, DenoiseRecipe = "Fan / hum", KeepRawAudio = true, InputGainDb = 0 };
+    fromProfile.CopyDenoiseFrom(fromUser);
+    Check("record denoise: profile cannot switch noise reduction off",
+        fromProfile.DenoiseOnRecord && RecordingDenoise.BuildChain(fromProfile).StartsWith("highpass=f=150:poles=2,afftdn="),
+        fromProfile.Describe());
+    Check("record denoise: profile keeps its own gain/bitrate after the copy",
+        Math.Abs(fromProfile.InputGainDb - 15f) < 0.001f && fromProfile.AacBitrateKbps == fromUser.AacBitrateKbps, fromProfile.Describe());
+    Check("record denoise: keep-raw comes from Audio Settings too", fromProfile.KeepRawAudio, fromProfile.Describe());
+
+    var margs = RecordingDenoise.BuildMergeArgs("v.mp4", @"C:\rec\a.wav", @"C:\rec\out.mp4", 192, "highpass=f=100:poles=2");
+    var mcmd = string.Join(" ", margs);
+    Check("record merge args: video copied, audio aac 192k",
+        mcmd.Contains("-c:v copy") && mcmd.Contains("-b:a 192k"), mcmd);
+    Check("record merge args: recorded wav mapped as audio and filtered",
+        mcmd.Contains("-map 0:v:0 -map 1:a:0") && mcmd.Contains("-af highpass=f=100:poles=2"), mcmd);
+    Check("record merge args: no -af when nothing is enabled",
+        !string.Join(" ", RecordingDenoise.BuildMergeArgs("v.mp4", "a.wav", "out.mp4", 192, "")).Contains("-af"), "");
+    Check("record merge args: -shortest and output last",
+        margs.Contains("-shortest") && margs[^1] == @"C:\rec\out.mp4", mcmd);
+}
+
 // ---------- 2. ffprobe ----------
 MediaInfo info = svc.ProbeAsync(noisy).GetAwaiter().GetResult();
 Check("probe: video+audio", info.IsValid && info.HasVideo && info.HasAudio, info.ToText());

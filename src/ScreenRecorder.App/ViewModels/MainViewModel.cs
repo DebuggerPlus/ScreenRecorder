@@ -271,6 +271,10 @@ public partial class MainViewModel : ObservableObject
         string? audioId = SelectedAudioDevice?.Id;
 
         var audio = _activeAudio?.Clone() ?? _settings.Current.Audio.Clone();
+        // Шумоподавление при съёмке — пользовательская настройка (Audio Settings), профиль кодирования
+        // её не переопределяет: иначе применённый профиль молча выключает фильтрацию звука записи.
+        audio.CopyDenoiseFrom(_settings.Current.Audio);
+        audio.Normalize();
         var options = new RecordingOptions(capSource, AudioSourceMode.System, audioId, null, _lastFilePath,
             _activeVideo.Fps, _activeVideo.BitrateKbps, ShowCursor, ShowLogo, LogoPath, LogoText, LogoOpacity, LogoScale, SelectedLogoPosition,
             audio, _activeVideo);
@@ -423,6 +427,7 @@ public partial class MainViewModel : ObservableObject
         video.Normalize();
         _activeVideo = video;
         _activeAudio = ProfileApplyAudio ? BuildAudioFromEditors() : _settings.Current.Audio.Clone();
+        _activeAudio?.CopyDenoiseFrom(_settings.Current.Audio); // профиль не выключает шумоподавление при съёмке
         SelectedProfile.Profile.Video = video;
         if (ProfileApplyAudio && _activeAudio != null) SelectedProfile.Profile.Audio = _activeAudio.Clone();
         _settings.Current.LastProfileFile = SelectedProfile.FileName;

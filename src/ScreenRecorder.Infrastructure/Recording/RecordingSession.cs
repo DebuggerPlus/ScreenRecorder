@@ -119,22 +119,32 @@ public class RecordingSession : IRecordingSession
         if (!string.IsNullOrEmpty(_tempAudioPath) && File.Exists(_tempAudioPath))
         {
             _logger.Log("Merging video and audio...");
+            // Шумоподавление при съёмке: та же цепочка, что в окне обработки, применяется к записанному WAV
+            // здесь, на склейке. В живой поток NAudio её не вставить (afftdn/arnndn — фильтры ffmpeg).
+            var denoiseChain = RecordingDenoise.BuildChain(_audioSettings);
+            if (denoiseChain.Length > 0)
+                _logger.Log($"Denoise on record: recipe '{_audioSettings.DenoiseRecipe}' -> -af {denoiseChain}");
             try
             {
-                var mergeArgs = new[]
+                var (code, err) = await FfmpegRunner.RunAsync(RecordingDenoise.BuildMergeArgs(
+                    tempVideo, _tempAudioPath, _finalVideoPath!, _audioSettings.AacBitrateKbps, denoiseChain));
+
+                if (code != 0 && denoiseChain.Length > 0)
                 {
-                    "-y", "-i", tempVideo, "-i", _tempAudioPath,
-                    "-map", "0:v:0", "-map", "1:a:0",
-                    "-c:v", "copy", "-c:a", "aac", "-b:a", $"{_audioSettings.AacBitrateKbps}k",
-                    "-shortest",
-                    _finalVideoPath!
-                };
-                var (code, err) = await FfmpegRunner.RunAsync(mergeArgs);
+                    // Фильтр не должен стоить нам звука: повторяем склейку без него.
+                    _logger.Log($"Merge with denoise FAILED (ffmpeg exit {code}) — retrying without filters.");
+                    (code, err) = await FfmpegRunner.RunAsync(RecordingDenoise.BuildMergeArgs(
+                        tempVideo, _tempAudioPath, _finalVideoPath!, _audioSettings.AacBitrateKbps, null));
+                }
+
                 if (code == 0 && File.Exists(_finalVideoPath!))
                 {
                     try { File.Delete(tempVideo); } catch { }
-                    try { File.Delete(_tempAudioPath); } catch { }
-                    _logger.Log("Merge complete.");
+                    if (_audioSettings.KeepRawAudio)
+                        _logger.Log($"Raw audio kept (before denoise): {_tempAudioPath}");
+                    else
+                        try { File.Delete(_tempAudioPath); } catch { }
+                    _logger.Log(denoiseChain.Length > 0 ? "Merge complete (denoise applied)." : "Merge complete.");
                 }
                 else
                 {

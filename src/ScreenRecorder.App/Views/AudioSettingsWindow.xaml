@@ -139,6 +139,21 @@
                             </StackPanel>
                         </GroupBox>
 
+                        <GroupBox Header="Noise reduction while recording">
+                            <StackPanel>
+                                <CheckBox Content="Apply noise reduction to the recording (fan / hum, room noise)" FontWeight="SemiBold"
+                                          IsChecked="{Binding DenoiseOnRecord}"/>
+                                <TextBlock Text="Recipe" Style="{StaticResource FieldLabel}"/>
+                                <ComboBox ItemsSource="{Binding DenoiseRecipeNames}" SelectedItem="{Binding DenoiseRecipe}"
+                                          IsEnabled="{Binding DenoiseOnRecord}" Height="28" Width="340" HorizontalAlignment="Left"/>
+                                <CheckBox Content="Keep the raw audio (before noise reduction) next to the video" Margin="0,10,0,0"
+                                          IsChecked="{Binding KeepRawAudio}"/>
+                                <TextBlock Text="{Binding DenoiseChainText}" Style="{StaticResource Hint}" FontFamily="Consolas" Foreground="#00537A"/>
+                                <TextBlock Style="{StaticResource Hint}"
+                                           Text="The capture itself is done by NAudio, while these filters belong to ffmpeg, so the recipe is applied to the recorded WAV at the moment it is merged with the video: the saved MP4 is already clean and 'Process the whole file' is not needed. Recipes are the same as in the Process Video window. If the filter pass fails, the merge is retried without it, so a recording is never lost — the log says which one happened."/>
+                            </StackPanel>
+                        </GroupBox>
+
                         <Button Content="Reset all audio settings to defaults" Command="{Binding ResetToDefaultsCommand}"
                                 HorizontalAlignment="Left" Style="{StaticResource ActionButton}"/>
                     </StackPanel>
